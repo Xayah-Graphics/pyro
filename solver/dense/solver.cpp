@@ -31,7 +31,7 @@ namespace pyro::dense {
                 allocate(level.diagonal, layout.cells);
                 allocate(level.boundary, layout.cells);
                 for (auto& a : level.face) allocate(a, layout.cells);
-                allocate(level.solution, layout.cells);
+                allocate(level.solution, layout.cells, l != 0);
                 allocate(level.rhs, layout.cells);
                 allocate(level.temporary, layout.cells);
                 if (size.x * size.y * size.z <= 512) break;
@@ -46,16 +46,17 @@ namespace pyro::dense {
             for (auto& u : grid.solidVelocity) allocate(u, cells);
             cuda::dense::Fields* fields[]{&grid.state, &grid.midpoint, &grid.next};
             for (auto field : fields) {
-                for (auto& u : field->velocity) allocate(u, cells);
-                allocate(field->smoke, cells);
-                allocate(field->temperature, cells);
+                for (auto& u : field->velocity) allocate(u, cells, false);
+                allocate(field->smoke, cells, false);
+                allocate(field->temperature, cells, false);
             }
-            allocate(pressure.direction, cells);
-            allocate(pressure.product, cells);
-            allocate(pressure.solution, cells);
-            allocate(pressure.residual, cells);
+            allocate(pressure.direction, cells, false);
+            allocate(pressure.product, cells, false);
+            allocate(pressure.solution, cells, false);
+            allocate(pressure.residual, cells, false);
             // Advection and projection never overlap. Reuse Krylov work vectors
             // for the forward transport pass; each pressure solve starts afresh.
+            // initialize_grid writes all four fields, including their padding.
             grid.transported.velocity[0] = pressure.direction;
             grid.transported.velocity[1] = pressure.product;
             grid.transported.velocity[2] = pressure.solution;
@@ -82,6 +83,7 @@ namespace pyro::dense {
     }
 
     void Solver::set_sources(const Source* data, int count) {
+        if (!sources_changed(std::span(data, static_cast<std::size_t>(count)), sourceInputs)) return;
         if (count > sourceCapacity) {
             release(sources, sourceCapacity);
             allocate(sources, count);
@@ -95,11 +97,13 @@ namespace pyro::dense {
             return;
         }
         std::vector<cuda::Source> upload(count);
+        std::vector<int> cache;
         for (int i = 0; i < count; ++i) {
             const auto& source = data[i];
             upload[i]          = device_input(source, meshes);
-            auto& region       = sourceRegions[i];
-            region.cached      = source.shape != Shape::mesh || std::ranges::all_of(source.motion.derivative, [](float d) { return d == 0; });
+            if (i < static_cast<int>(sourceInputs.size()) && !source_geometry_changed(source, sourceInputs[i])) continue;
+            auto& region  = sourceRegions[i];
+            region.cached = source.shape != Shape::mesh || std::ranges::all_of(source.motion.derivative, [](float d) { return d == 0; });
             cuda::Bounds bounds;
             if (source.shape == Shape::mesh) bounds = std::bit_cast<cuda::Bounds>(source.motion.swept);
             else {
@@ -123,24 +127,17 @@ namespace pyro::dense {
                 allocate(region.weights, cells * 4ull);
                 region.capacity = cells;
             }
+            if (region.cached) cache.push_back(i);
         }
         cuda_check(cudaMemcpyAsync(sources, upload.data(), count * sizeof(cuda::Source), cudaMemcpyHostToDevice, stream));
-        for (int i = 0; i < count; ++i) {
-            const auto& current = data[i];
-            bool dirty          = i >= static_cast<int>(sourceInputs.size());
-            if (!dirty) {
-                const auto& previous = sourceInputs[i];
-                dirty                = current.shape != previous.shape || current.mesh != previous.mesh || current.center != previous.center || current.halfExtent != previous.halfExtent || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || !std::ranges::equal(current.motion.derivative, previous.motion.derivative);
-            }
-            if (dirty && sourceRegions[i].cached) cuda::dense::cache_source(grid, parameters, sources, i, sourceRegions[i], stream);
-        }
+        for (int i : cache) cuda::dense::cache_source(grid, parameters, sources, i, sourceRegions[i], stream);
         sourceInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
 
         synchronize();
     }
 
     void Solver::set_colliders(const Collider* data, int count) {
-        geometryDirty       = geometryDirty || !grid.staticGeometry || colliderInputs.size() != static_cast<std::size_t>(count);
+        bool changed        = !grid.staticGeometry || colliderInputs.size() != static_cast<std::size_t>(count);
         grid.staticGeometry = true;
         for (int i = 0; i < count; ++i) {
             const auto& current = data[i];
@@ -150,14 +147,17 @@ namespace pyro::dense {
                 for (float velocity : current.linearVelocity) grid.staticGeometry &= velocity == 0.0f;
                 for (float velocity : current.angularVelocity) grid.staticGeometry &= velocity == 0.0f;
             }
-            if (!geometryDirty) {
+            if (!changed) {
                 const auto& previous = colliderInputs[i];
-                geometryDirty        = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
-                if (current.shape == Shape::mesh) geometryDirty |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix);
-                else geometryDirty |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation;
+                changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
+                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || current.motion.maxSpeed != previous.motion.maxSpeed;
+                else changed |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation;
             }
         }
-        geometryDirty |= !grid.staticGeometry;
+        changed |= !grid.staticGeometry;
+        if (!changed) return;
+        geometryDirty      = true;
+        grid.colliderSpeed = collider_speed(std::span(data, static_cast<std::size_t>(count)));
         colliderInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
         if (count > colliderCapacity) {
             release(colliders, colliderCapacity);
@@ -228,7 +228,7 @@ namespace pyro::dense {
             }
             cuda_check(cudaEventRecord(events[1], stream));
             cuda_check(cudaEventRecord(events[7], stream));
-            cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, false, stream);
+            cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, static_cast<float>(time), pressure.reductions, maximum, false, stream);
             cuda_check(cudaEventRecord(events[8], stream));
             float bounds[2];
             cuda_check(cudaMemcpyAsync(bounds, maximum, sizeof(bounds), cudaMemcpyDeviceToHost, stream));
@@ -249,7 +249,7 @@ namespace pyro::dense {
                 auto destination = stage ? grid.next : grid.midpoint;
                 auto carrier     = stage ? grid.midpoint : grid.state;
                 cuda_check(cudaEventRecord(events[2], stream));
-                cuda::dense::advect(grid, parameters, destination, grid.state, carrier, colliders, colliderCount, static_cast<float>(time), stageStep, stream);
+                cuda::dense::advect(grid, parameters, destination, grid.state, carrier, colliderCount != 0, static_cast<float>(time), stageStep, stream);
                 cuda_check(cudaEventRecord(events[3], stream));
                 cuda::dense::apply_sources_forces(grid, parameters, destination, carrier, sources, sourceRegions.data(), sourceCount, static_cast<float>(time), stageStep, stream);
                 cuda_check(cudaEventRecord(events[4], stream));
@@ -272,7 +272,7 @@ namespace pyro::dense {
             ++statistics.substeps;
         }
         cuda_check(cudaEventRecord(events[7], stream));
-        cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, true, stream);
+        cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, static_cast<float>(time), pressure.reductions, maximum, true, stream);
         cuda_check(cudaEventRecord(events[8], stream));
         double result[6];
         cuda_check(cudaMemcpyAsync(result, pressure.reductions + grid.layout.blocks * 6ull, sizeof(result), cudaMemcpyDeviceToHost, stream));
@@ -316,7 +316,7 @@ namespace pyro::dense {
                 synchronize();
                 transfer(buffer.data(), buffer.size() * sizeof(float));
             }
-            synchronize();
+            if (restore) synchronize();
         }
         if (restore) geometryDirty = matrixDirty = true;
     }
@@ -335,9 +335,9 @@ namespace pyro::dense {
     }
 
     template <typename T>
-    void Solver::allocate(T*& pointer, unsigned long long count) {
+    void Solver::allocate(T*& pointer, unsigned long long count, bool clear) {
         cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&pointer), count * sizeof(T), stream));
-        cuda_check(cudaMemsetAsync(pointer, 0, count * sizeof(T), stream));
+        if (clear) cuda_check(cudaMemsetAsync(pointer, 0, count * sizeof(T), stream));
         statistics.allocatedBytes += count * sizeof(T);
     }
 
@@ -351,14 +351,11 @@ namespace pyro::dense {
 
     void Solver::project(cuda::dense::Fields fields) {
         auto& workspace = pressure;
-        auto& fine      = workspace.levels[0];
-        fine.layout     = grid.layout;
-        if (!fine.layout.blocks) return;
         cuda::dense::assemble_pressure(grid, fields, workspace, config.cellSize, colliderCount != 0, matrixDirty, stream);
         if (matrixDirty)
             for (int l = 1; l < workspace.levelCount; ++l) cuda::dense::coarse_matrix(workspace.levels[l - 1], workspace.levels[l], stream);
         matrixDirty = false;
-        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(cuda::dense::IterationState), stream));
+        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(cuda::IterationState), stream));
         cuda::dense::begin_pressure(workspace, parameters, stream);
         auto executable = workspace.graph;
         if (!executable) {
@@ -370,7 +367,7 @@ namespace pyro::dense {
             cuda_check(cudaGraphDestroy(graph));
             workspace.graph = executable;
         }
-        cuda::dense::IterationState status{};
+        cuda::IterationState status{};
         for (;;) {
             int remaining = config.pressureMaxIterations - status.iterations;
             if (remaining >= 8) cuda_check(cudaGraphLaunch(executable, stream));
@@ -394,7 +391,6 @@ namespace pyro::dense {
         }
         if (status.failed || status.maxResidual > config.divergenceTolerance * 0.5f) throw std::runtime_error("Pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true residual=" + std::to_string(status.maxResidual));
         cuda::dense::apply_pressure(grid, fields, workspace.solution, config.cellSize, parameters.wind, stream);
-        cuda_check(cudaStreamSynchronize(stream));
         statistics.pressureIterations += status.iterations;
         statistics.pressureLevels = workspace.levelCount;
     }

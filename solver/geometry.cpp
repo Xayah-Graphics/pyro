@@ -16,6 +16,41 @@ namespace pyro {
         return {std::bit_cast<float3>(collider.center), std::bit_cast<float3>(collider.halfExtent), std::bit_cast<float4>(collider.orientation), std::bit_cast<float3>(collider.linearVelocity), std::bit_cast<float3>(collider.angularVelocity), collider.poseTime, static_cast<cuda::Shape>(collider.shape), collider.shape == Shape::mesh ? meshes[collider.mesh] : cuda::Mesh{}, std::bit_cast<cuda::Motion>(collider.motion), collider.surfaceOffset};
     }
 
+    bool source_geometry_changed(const Source& current, const Source& previous) {
+        if (current.shape != previous.shape) return true;
+        if (current.shape != Shape::mesh) return current.center != previous.center || current.halfExtent != previous.halfExtent;
+        return current.mesh != previous.mesh || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(current.motion.derivative, [](float value) { return value != 0; }) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
+    }
+
+    bool sources_changed(std::span<const Source> current, std::span<const Source> previous) {
+        if (current.size() != previous.size()) return true;
+        for (std::size_t i = 0; i < current.size(); ++i) {
+            const auto& a = current[i];
+            const auto& b = previous[i];
+            if (source_geometry_changed(a, b) || a.velocity != b.velocity || a.smokeRate != b.smokeRate || a.temperatureRate != b.temperatureRate || a.velocityRate != b.velocityRate || a.startTime != b.startTime || a.endTime != b.endTime || a.inheritVelocity != b.inheritVelocity || a.motion.maxSpeed != b.motion.maxSpeed) return true;
+        }
+        return false;
+    }
+
+    float collider_speed(std::span<const Collider> colliders) {
+        double speed = 0;
+        for (const auto& collider : colliders) {
+            double bound = collider.motion.maxSpeed;
+            if (collider.shape != Shape::mesh) {
+                double linear = 0, angular = 0, extent = 0;
+                for (int axis = 0; axis < 3; ++axis) {
+                    linear += double(collider.linearVelocity[axis]) * collider.linearVelocity[axis];
+                    angular += double(collider.angularVelocity[axis]) * collider.angularVelocity[axis];
+                    extent += double(collider.halfExtent[axis]) * collider.halfExtent[axis];
+                }
+                bound = std::sqrt(linear) + std::sqrt(angular) * std::sqrt(extent);
+            }
+            speed = std::max(speed, bound);
+        }
+        // Round upward so the cached FP32 bound remains conservative.
+        return speed > 0 ? std::nextafter(static_cast<float>(speed), std::numeric_limits<float>::infinity()) : 0;
+    }
+
     cuda::Mesh upload_mesh(std::span<const Triangle> triangles, float band, cudaStream_t stream) {
         static_assert(sizeof(Triangle) == sizeof(cuda::Triangle));
         cuda::Mesh mesh;

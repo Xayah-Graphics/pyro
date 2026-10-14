@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 4.4)
 set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "f35a9ac6-8463-4d38-8eec-5d6008153e7d")
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" PYRO_VERSION LIMIT_COUNT 1)
-project(PYRO VERSION "${PYRO_VERSION}" LANGUAGES C CXX CUDA)
+project(PYRO VERSION "${PYRO_VERSION}" LANGUAGES CXX CUDA)
 
 # ============================================================================
 # Project Configuration

@@ -1,6 +1,7 @@
 #ifndef PYRO_SPARSE_CUDA_CUH
 #define PYRO_SPARSE_CUDA_CUH
 #include "../geometry.cuh"
+#include "../pressure.cuh"
 
 namespace pyro::cuda::sparse {
     inline constexpr unsigned long long emptyKey = ~0ull;
@@ -57,7 +58,7 @@ namespace pyro::cuda::sparse {
         float* samples[3]{}; // Native 11^3 ghost tiles for original, carrier and reverse transport.
         unsigned char* uniformSamples{};
         float* distance[3]{}; // Exact native 9^3 corner samples at t, t+dt/2 and t+dt.
-        float geometryTime{}, geometryDuration{};
+        float geometryTime{}, geometryDuration{}, colliderSpeed{};
         bool staticGeometry{true};
     };
     struct Scratch {
@@ -97,11 +98,6 @@ namespace pyro::cuda::sparse {
         float* temporary{};
         int count{}, edgeCount{}, capacity{}, edgeCapacity{};
     };
-    struct IterationState {
-        double rz{}, previousRz{}, denominator{}, initialNorm{};
-        float maxResidual{};
-        int iterations{}, converged{}, failed{};
-    };
     struct PressureWorkspace {
         PressureLevel* levels{};
         int levelCount{};
@@ -127,9 +123,9 @@ namespace pyro::cuda::sparse {
     void sample_geometry(Grid grid, Layout previous, const float* previousDistance, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
     void geometry(Grid grid, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
     void remap(Grid oldGrid, Grid newGrid, Config config, cudaStream_t stream);
-    void advect(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt, cudaStream_t stream);
+    void advect(Grid grid, Fields destination, Fields carrier, Config config, bool obstacles, float time, float dt, cudaStream_t stream);
     void forces(Grid grid, Fields destination, Fields carrier, Config config, const Source* sources, int count, float time, float dt, cudaStream_t stream);
-    void measure(Grid grid, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, bool full, double* reductions, cudaStream_t stream);
+    void measure(Grid grid, Config config, const Source* sources, int sourceCount, float time, bool full, double* reductions, cudaStream_t stream);
     bool fine_matrix(Grid grid, PressureWorkspace workspace, bool obstacles, cudaStream_t stream);
     int coarse_nodes(PressureLevel fine, PressureLevel coarse, Scratch scratch, int depth, cudaStream_t stream);
     int coarse_edges(PressureLevel fine, PressureLevel coarse, Scratch scratch, cudaStream_t stream);

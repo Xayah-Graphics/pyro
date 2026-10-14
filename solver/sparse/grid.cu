@@ -153,7 +153,7 @@ namespace pyro::cuda::sparse {
         Node n        = node(topology.roots[i]);
         blocks[index] = {n.coordinate, n.level};
     }
-    __global__ void mark_refinement(Layout layout, Topology topology, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, float horizon, bool enforceRequests) {
+    __global__ void mark_refinement(Layout layout, Topology topology, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, float horizon, float colliderSpeed, bool enforceRequests) {
         int b = blockIdx.x * blockDim.x + threadIdx.x;
         if (b >= layout.count) return;
         auto block = layout.blocks[b];
@@ -170,9 +170,7 @@ namespace pyro::cuda::sparse {
                 split |= source_weight(s, center, support, time + .5f * horizon) > 0;
             }
             if (colliderCount) {
-                float speed = 0;
-                for (int i = 0; i < colliderCount; ++i) speed = fmaxf(speed, colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent));
-                float band = 7.f * h + speed * horizon;
+                float band = 7.f * h + colliderSpeed * horizon;
                 float d    = solid_distance(center, time + .5f * horizon, colliders, colliderCount, nullptr, nullptr, band);
                 split |= fabsf(d) < band;
             }
@@ -236,7 +234,7 @@ namespace pyro::cuda::sparse {
         for (int pass = 0; pass < config.levels * 2 && layout.count; ++pass) {
             rebuild_hash(layout, stream);
             cuda_check(cudaMemsetAsync(topology.split, 0, layout.count * sizeof(int), stream));
-            mark_refinement<<<(layout.count + 255) / 256, 256, 0, stream>>>(layout, topology, config, sources, sourceCount, colliders, colliderCount, time, horizon, pass < config.levels);
+            mark_refinement<<<(layout.count + 255) / 256, 256, 0, stream>>>(layout, topology, config, sources, sourceCount, colliders, colliderCount, time, horizon, oldGrid.colliderSpeed, pass < config.levels);
             balance<<<layout.count, 32, 0, stream>>>(layout, topology.split);
             cuda_check(cudaMemsetAsync(topology.counters, 0, 2 * sizeof(int), stream));
             split_blocks<<<(layout.count + 255) / 256, 256, 0, stream>>>(layout, topology, output);

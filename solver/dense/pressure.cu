@@ -58,18 +58,6 @@ namespace pyro::cuda::dense {
         }
     }
 
-    __device__ int root(int* parents, int i) {
-        int p = atomicAdd(parents + i, 0);
-        while (p != i) {
-            // Parent labels only decrease during concurrent union and path splitting.
-            int next = atomicAdd(parents + p, 0);
-            atomicMin(parents + i, next);
-            i = p;
-            p = next;
-        }
-        return i;
-    }
-
     __global__ void connect_components(PressureLevel level, const unsigned char* fluid, int* parents) {
         int id = static_cast<int>(blockIdx.x);
         for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
@@ -78,13 +66,13 @@ namespace pyro::cuda::dense {
             for (int axis = 0; axis < 3; ++axis) {
                 if (level.face[axis][i] <= 0.0f) continue;
                 int j = neighbor(level.layout, i, axis, -1);
-                int a = root(parents, i), b = root(parents, j);
+                int a = component_root(parents, i), b = component_root(parents, j);
                 while (a != b) {
                     int high = max(a, b), low = min(a, b);
                     int old = atomicCAS(parents + high, high, low);
                     if (old == high) break;
-                    a = root(parents, old);
-                    b = root(parents, low);
+                    a = component_root(parents, old);
+                    b = component_root(parents, low);
                 }
             }
         }
@@ -94,7 +82,7 @@ namespace pyro::cuda::dense {
         int id = static_cast<int>(blockIdx.x);
         for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
             int i = id * tileCells + local;
-            int r = root(parents, i);
+            int r = component_root(parents, i);
             atomicExch(parents + i, r);
             if (level.temporary[i] > 0.0f) atomicExch(open + r, 1);
         }
@@ -303,43 +291,6 @@ namespace pyro::cuda::dense {
         }
     }
 
-    __global__ void finish_dot(double* partial, int count, IterationState* state, int operation, float relativeTolerance, float absoluteTolerance) {
-        if (state->converged || state->failed) return;
-        __shared__ double sums[threads], maxima[threads];
-        double sum = 0.0, largest = 0.0;
-        for (int i = threadIdx.x; i < count; i += blockDim.x) {
-            sum += partial[i];
-            largest = fmax(largest, partial[count + i]);
-        }
-        sums[threadIdx.x]   = sum;
-        maxima[threadIdx.x] = largest;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                sums[threadIdx.x] += sums[threadIdx.x + stride];
-                maxima[threadIdx.x] = fmax(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x) return;
-        if (!isfinite(sums[0])) {
-            state->failed = 1;
-            return;
-        }
-        if (operation == 0) {
-            state->previousRz = state->rz;
-            state->rz         = sums[0];
-        } else if (operation == 1) {
-            state->denominator = sums[0];
-            if (sums[0] <= 0.0) state->failed = 1;
-        } else {
-            if (operation == 2) state->initialNorm = sums[0];
-            state->maxResidual = static_cast<float>(maxima[0]);
-            bool relative      = sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance;
-            state->converged   = maxima[0] <= absoluteTolerance && (relative || maxima[0] <= absoluteTolerance * 0.1f);
-        }
-    }
-
     __global__ void search_direction(PressureLevel level, float* direction, const IterationState* state, bool first) {
         if (state->converged || state->failed) return;
         int id     = static_cast<int>(blockIdx.x);
@@ -483,10 +434,10 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         int count = fine.layout.blocks;
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
         precondition(workspace, stream);
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
         search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
     }
 
@@ -494,13 +445,13 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         int count = fine.layout.blocks;
         apply_matrix<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0.0f, 0.0f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0.0f, 0.0f);
         update_iterate<<<count, threads, 0, stream>>>(fine, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
         count_iteration<<<1, 1, 0, stream>>>(workspace.iteration);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
         precondition(workspace, stream);
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
         search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
     }
 
@@ -508,7 +459,7 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         true_residual<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.solution, workspace.residual);
         dot_blocks<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, fine.layout.blocks, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.5f);
+        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, fine.layout.blocks, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.5f);
     }
 
     void apply_pressure(Grid grid, Fields fields, const float* pressure, float h, float3 wind, cudaStream_t stream) {

@@ -1,10 +1,10 @@
 #include "cuda.cuh"
 
 namespace pyro::cuda::dense {
-    __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float endTime, float dt, const Collider* colliders, int count, bool& clipped) {
+    __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float endTime, float dt, bool obstacles, bool& clipped) {
         Layout layout = grid.layout;
         clipped       = false;
-        if (count) {
+        if (obstacles) {
             float3 world   = grid.origin + p * h;
             float distance = sample_boundary(grid, world, endTime, h);
             if (distance < 0.01f * h) {
@@ -20,10 +20,8 @@ namespace pyro::cuda::dense {
         float3 first     = sample_velocity(layout, carrier, p, wind);
         float3 middle    = sample_velocity(layout, carrier, p - first * (0.5f * dt / h), wind);
         float3 departure = p - middle * (dt / h);
-        if (!count) return departure;
-        float motion = 0.0f;
-        for (int i = 0; i < count; ++i) motion = fmaxf(motion, (colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent)));
-        float bound = length(departure - p) * h + motion * fabsf(dt);
+        if (!obstacles) return departure;
+        float bound = length(departure - p) * h + grid.colliderSpeed * fabsf(dt);
         if (bound < 1.0e-12f) return departure;
         float fraction = 0.0f;
         // Conservative advancement through the swept space-time SDF.
@@ -42,7 +40,7 @@ namespace pyro::cuda::dense {
     }
 
     template <bool correct>
-    __global__ void transport_velocity(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float time, float dt) {
+    __global__ void transport_velocity(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float time, float dt) {
         int id = static_cast<int>(blockIdx.x), axis = blockIdx.y;
         for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
             int i         = id * tileCells + local;
@@ -64,11 +62,11 @@ namespace pyro::cuda::dense {
             const float* input = original.velocity[axis];
             float background   = component(config.wind, axis);
             bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, colliders, count, clipped);
+            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, obstacles, clipped);
             float lo, hi;
             float transported = sample(grid.layout, input, departure - stagger, background, &lo, &hi);
             if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, colliders, count, clipped);
+                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, obstacles, clipped);
                 if (!clipped) transported = fminf(hi, fmaxf(lo, transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], reverse - stagger, background))));
             }
             output[i] = transported;
@@ -97,7 +95,7 @@ namespace pyro::cuda::dense {
     }
 
     template <bool correct>
-    __global__ void transport_scalars(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float time, float dt) {
+    __global__ void transport_scalars(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float time, float dt) {
         int id = static_cast<int>(blockIdx.x);
         for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
             int i = id * tileCells + local;
@@ -109,11 +107,11 @@ namespace pyro::cuda::dense {
             int3 c = cell_coordinate(grid.layout, i);
             float3 stagger{0.5f, 0.5f, 0.5f}, p{c.x + 0.5f, c.y + 0.5f, c.z + 0.5f};
             bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, colliders, count, clipped);
+            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, obstacles, clipped);
             float2 lo, hi;
             float2 transported = sample_scalars(grid.layout, original, departure - stagger, &lo, &hi);
             if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, colliders, count, clipped);
+                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, obstacles, clipped);
                 if (!clipped) {
                     float2 backward = sample_scalars(grid.layout, grid.transported, reverse - stagger);
                     transported.x   = fminf(hi.x, fmaxf(lo.x, transported.x + 0.5f * (original.smoke[i] - backward.x)));
@@ -242,7 +240,7 @@ namespace pyro::cuda::dense {
             for (int k = 0; k < 6; ++k) partial[6 * blockIdx.x + k] = sums[k][0];
     }
 
-    __global__ void finish_statistics(int count, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* partial, float* maximum) {
+    __global__ void finish_statistics(int count, Config config, const Source* sources, int sourceCount, float colliderSpeed, float time, double* partial, float* maximum) {
         __shared__ double sums[6][threads];
         double values[6]{};
         for (int i = threadIdx.x; i < count; i += blockDim.x)
@@ -270,17 +268,17 @@ namespace pyro::cuda::dense {
             speed = fmaxf(speed, length(source.velocity) + source.motion.maxSpeed * fmaxf(1.0f, source.inheritVelocity));
             acceleration += (fabsf(config.buoyancy * source.temperatureRate) + fabsf(config.smokeWeight * source.smokeRate)) * config.maxTimeStep * length(config.up);
         }
-        for (int i = 0; i < colliderCount; ++i) speed = fmaxf(speed, (colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent)));
+        speed      = fmaxf(speed, colliderSpeed);
         maximum[0] = speed;
         maximum[1] = acceleration;
     }
 
-    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float startTime, float dt, cudaStream_t stream) {
+    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float startTime, float dt, cudaStream_t stream) {
         dim3 velocityBlocks(grid.layout.blocks, 3);
-        transport_velocity<false><<<velocityBlocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, colliders, count, startTime, dt);
-        transport_scalars<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, colliders, count, startTime, dt);
-        transport_velocity<true><<<velocityBlocks, threads, 0, stream>>>(grid, config, destination, original, carrier, colliders, count, startTime, dt);
-        transport_scalars<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, colliders, count, startTime, dt);
+        transport_velocity<false><<<velocityBlocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, startTime, dt);
+        transport_scalars<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, startTime, dt);
+        transport_velocity<true><<<velocityBlocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, startTime, dt);
+        transport_scalars<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, startTime, dt);
     }
 
     void cache_source(Grid grid, Config config, const Source* sources, int index, SourceRegion region, cudaStream_t stream) {
@@ -300,11 +298,9 @@ namespace pyro::cuda::dense {
         decay_kernel<<<grid.layout.blocks, threads, 0, stream>>>(config, destination, dt);
     }
 
-    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {
-        if (grid.layout.blocks) {
-            if (full) statistics_kernel<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
-            else statistics_kernel<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
-        }
-        finish_statistics<<<1, threads, 0, stream>>>(grid.layout.blocks, config, sources, sourceCount, colliders, colliderCount, time, reductions, maximum);
+    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {
+        if (full) statistics_kernel<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
+        else statistics_kernel<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
+        finish_statistics<<<1, threads, 0, stream>>>(grid.layout.blocks, config, sources, sourceCount, grid.colliderSpeed, time, reductions, maximum);
     }
 } // namespace pyro::cuda::dense

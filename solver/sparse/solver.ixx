@@ -65,7 +65,7 @@ export namespace pyro::sparse {
         std::vector<std::array<cudaEvent_t, 2>> events;
 
         template <typename T>
-        void allocate(T*& pointer, unsigned long long count);
+        void allocate(T*& pointer, unsigned long long count, unsigned long long zeroFrom = 0);
         template <typename T>
         void release(T*& pointer, unsigned long long count);
         template <typename T>

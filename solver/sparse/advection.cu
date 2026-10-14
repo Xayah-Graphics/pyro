@@ -2,7 +2,7 @@
 
 namespace pyro::cuda::sparse {
     template <bool obstacles>
-    __device__ float3 trace(Grid grid, Fields carrier, Config config, float3 p, float time, float dt, const Collider* colliders, int count, bool& clipped) {
+    __device__ float3 trace(Grid grid, Fields carrier, Config config, float3 p, float time, float dt, bool& clipped) {
         clipped = false;
         float h = config.cellSize;
         if constexpr (obstacles) {
@@ -20,9 +20,7 @@ namespace pyro::cuda::sparse {
         float3 v = sample_velocity(grid, carrier, p, config.wind), middle = sample_velocity(grid, carrier, p - v * (.5f * dt), config.wind);
         float3 departure = p - middle * dt;
         if constexpr (!obstacles) return departure;
-        float motion = 0;
-        for (int i = 0; i < count; ++i) motion = fmaxf(motion, colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent));
-        float bound = length(departure - p) + motion * fabsf(dt), fraction = 0;
+        float bound = length(departure - p) + grid.colliderSpeed * fabsf(dt), fraction = 0;
         if (bound < 1.e-12f) return departure;
         for (int step = 0; step < 64; ++step) {
             float3 q = p + (departure - p) * fraction;
@@ -38,7 +36,7 @@ namespace pyro::cuda::sparse {
         return p + (departure - p) * fraction;
     }
     template <bool correct, bool obstacles>
-    __global__ void transport_cells(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt) {
+    __global__ void transport_cells(Grid grid, Fields destination, Fields carrier, Config config, float time, float dt) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= grid.layout.count * 512) return;
         if (!grid.fluid[i]) {
@@ -47,8 +45,8 @@ namespace pyro::cuda::sparse {
         }
         float3 p = center(grid.layout, i);
         bool clipped, reverseClipped = true;
-        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, colliders, count, clipped), reverse{};
-        if (correct && !clipped) reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, colliders, count, reverseClipped);
+        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, clipped), reverse{};
+        if (correct && !clipped) reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, reverseClipped);
         for (int field = 3; field < 5; ++field) {
             float lo, hi, value = sample(grid, grid.state, departure, field, 0, &lo, &hi);
             if (correct && !clipped && !reverseClipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field))));
@@ -56,7 +54,7 @@ namespace pyro::cuda::sparse {
         }
     }
     template <bool correct, bool obstacles>
-    __global__ void transport_faces(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt) {
+    __global__ void transport_faces(Grid grid, Fields destination, Fields carrier, Config config, float time, float dt) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;
         if (f >= grid.layout.count * 1728) return;
         Face face = grid.faces[f];
@@ -73,10 +71,10 @@ namespace pyro::cuda::sparse {
             return;
         }
         bool clipped;
-        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, colliders, count, clipped);
+        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, clipped);
         float lo, hi, value = sample(grid, grid.state, departure, axis, component(config.wind, axis), &lo, &hi);
         if (correct && !clipped) {
-            float3 reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, colliders, count, clipped);
+            float3 reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, clipped);
             if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, component(config.wind, axis)))));
         }
         destination.velocity[f] = value;
@@ -130,7 +128,7 @@ namespace pyro::cuda::sparse {
             grid.uniformSamples[index] = uniform;
         }
     }
-    void advect(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt, cudaStream_t stream) {
+    void advect(Grid grid, Fields destination, Fields carrier, Config config, bool obstacles, float time, float dt, cudaStream_t stream) {
         grid.state.samples       = grid.samples[0];
         grid.transported.samples = grid.samples[2];
         cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.state, config.wind, grid.samples[0]);
@@ -140,18 +138,18 @@ namespace pyro::cuda::sparse {
             cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, carrier, config.wind, grid.samples[1]);
         }
 
-        if (count) {
-            transport_cells<false, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
-            transport_faces<false, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+        if (obstacles) {
+            transport_cells<false, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, time, dt);
+            transport_faces<false, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, time, dt);
             cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.transported, config.wind, grid.samples[2]);
-            transport_cells<true, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
-            transport_faces<true, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
+            transport_cells<true, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, time, dt);
+            transport_faces<true, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, time, dt);
         } else {
-            transport_cells<false, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
-            transport_faces<false, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+            transport_cells<false, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, time, dt);
+            transport_faces<false, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, time, dt);
             cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.transported, config.wind, grid.samples[2]);
-            transport_cells<true, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
-            transport_faces<true, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
+            transport_cells<true, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, time, dt);
+            transport_faces<true, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, time, dt);
         }
     }
     __global__ void scalar_forces(Grid grid, Fields destination, Config config, const Source* sources, int count, float time, float dt) {
@@ -238,7 +236,7 @@ namespace pyro::cuda::sparse {
             for (int k = 0; k < count; ++k) results[b * count + k] = sums[k][0];
     }
     template <bool full>
-    __global__ void finish_measure(Grid grid, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* results) {
+    __global__ void finish_measure(Grid grid, const Source* sources, int sourceCount, float time, double* results) {
         constexpr int count = full ? 6 : 2;
         int k               = threadIdx.x;
         if (k >= count) return;
@@ -247,17 +245,17 @@ namespace pyro::cuda::sparse {
         if (k == (full ? 2 : 0)) {
             for (int s = 0; s < sourceCount; ++s)
                 if (time >= sources[s].startTime && time <= sources[s].endTime) value = fmax(value, double(length(sources[s].velocity) + sources[s].motion.maxSpeed * sources[s].inheritVelocity));
-            for (int c = 0; c < colliderCount; ++c) value = fmax(value, double(colliders[c].shape == Shape::mesh ? colliders[c].motion.maxSpeed : length(colliders[c].linearVelocity) + length(colliders[c].angularVelocity) * length(colliders[c].halfExtent)));
+            value = fmax(value, double(grid.colliderSpeed));
         }
         results[grid.layout.count * count + k] = value;
     }
-    void measure(Grid grid, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, bool full, double* reductions, cudaStream_t stream) {
+    void measure(Grid grid, Config config, const Source* sources, int sourceCount, float time, bool full, double* reductions, cudaStream_t stream) {
         if (full) {
             if (grid.layout.count) measure_blocks<true><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
-            finish_measure<true><<<1, 32, 0, stream>>>(grid, sources, sourceCount, colliders, colliderCount, time, reductions);
+            finish_measure<true><<<1, 32, 0, stream>>>(grid, sources, sourceCount, time, reductions);
         } else {
             if (grid.layout.count) measure_blocks<false><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
-            finish_measure<false><<<1, 32, 0, stream>>>(grid, sources, sourceCount, colliders, colliderCount, time, reductions);
+            finish_measure<false><<<1, 32, 0, stream>>>(grid, sources, sourceCount, time, reductions);
         }
     }
 } // namespace pyro::cuda::sparse

@@ -2,16 +2,6 @@
 #include <cub/cub.cuh>
 
 namespace pyro::cuda::sparse {
-    __device__ int component_root(int* parents, int i) {
-        int p = atomicAdd(parents + i, 0);
-        while (p != i) {
-            int next = atomicAdd(parents + p, 0);
-            atomicMin(parents + i, next);
-            i = p;
-            p = next;
-        }
-        return i;
-    }
     // Level descriptors are host data; kernels receive individual descriptors.
     __global__ void initialize_fine(Grid grid, PressureLevel fine, int* parents, int* open, unsigned char* anchors) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -423,41 +413,6 @@ namespace pyro::cuda::sparse {
             partial[gridDim.x + blockIdx.x] = maxima[0];
         }
     }
-    __global__ void finish_dot(double* partial, int count, IterationState* state, int operation, float relativeTolerance, float absoluteTolerance) {
-        if (state->converged || state->failed) return;
-        __shared__ double sums[256], maxima[256];
-        double sum = 0, largest = 0;
-        for (int i = threadIdx.x; i < count; i += blockDim.x) {
-            sum += partial[i];
-            largest = fmax(largest, partial[count + i]);
-        }
-        sums[threadIdx.x]   = sum;
-        maxima[threadIdx.x] = largest;
-        __syncthreads();
-        for (int stride = 128; stride; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                sums[threadIdx.x] += sums[threadIdx.x + stride];
-                maxima[threadIdx.x] = fmax(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x) return;
-        if (!isfinite(sums[0])) {
-            state->failed = 1;
-            return;
-        }
-        if (operation == 0) {
-            state->previousRz = state->rz;
-            state->rz         = sums[0];
-        } else if (operation == 1) {
-            state->denominator = sums[0];
-            if (sums[0] <= 0) state->failed = 1;
-        } else {
-            if (operation == 2) state->initialNorm = sums[0];
-            state->maxResidual = float(maxima[0]);
-            state->converged   = maxima[0] <= absoluteTolerance && (sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance || maxima[0] <= absoluteTolerance * .1f);
-        }
-    }
     __global__ void direction_kernel(PressureLevel fine, float* direction, const IterationState* state, bool first) {
         if (state->converged || state->failed) return;
         int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -485,10 +440,10 @@ namespace pyro::cuda::sparse {
         int count = (fine.count + 255) / 256;
         component_sums(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
         precondition(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
         direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
     }
     void iterate_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
@@ -496,15 +451,15 @@ namespace pyro::cuda::sparse {
         int count = (fine.count + 255) / 256;
         product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.direction, workspace.product, workspace.iteration, false);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0, 0);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0, 0);
         update_kernel<<<count, 256, 0, stream>>>(fine.count, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.iteration);
         count_iteration<<<1, 1, 0, stream>>>(workspace.iteration);
         component_sums(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
         precondition(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
         direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
     }
     void check_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
@@ -513,7 +468,7 @@ namespace pyro::cuda::sparse {
         product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.solution, workspace.residual, workspace.iteration, true);
         component_sums(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .5f);
+        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .5f);
     }
     __global__ void project_faces(Grid grid, Fields fields, const double* pressure) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;

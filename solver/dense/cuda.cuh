@@ -1,6 +1,7 @@
 #ifndef PYRO_DENSE_CUDA_CUH
 #define PYRO_DENSE_CUDA_CUH
 #include "../geometry.cuh"
+#include "../pressure.cuh"
 namespace pyro::cuda::dense {
     inline constexpr int tileCells = 1024;
     struct Config {
@@ -47,7 +48,7 @@ namespace pyro::cuda::dense {
         float* solidVelocity[3]{};
         float* solidDivergence{};
         float* distance[3]{};
-        float geometryTime{}, geometryDuration{};
+        float geometryTime{}, geometryDuration{}, colliderSpeed{};
         bool staticGeometry{true};
         Fields state, midpoint, next, transported;
     };
@@ -60,11 +61,6 @@ namespace pyro::cuda::dense {
         float* solution{};
         float* rhs{};
         float* temporary{};
-    };
-    struct IterationState {
-        double rz{}, previousRz{}, denominator{}, initialNorm{};
-        float maxResidual{};
-        int iterations{}, converged{}, failed{};
     };
 
     struct PressureWorkspace {
@@ -85,11 +81,10 @@ namespace pyro::cuda::dense {
     void initialize_grid(Grid grid, float3 wind, cudaStream_t stream);
     void sample_geometry(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
     void update_boundary(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
-    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float startTime, float dt, cudaStream_t stream);
+    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float startTime, float dt, cudaStream_t stream);
     void cache_source(Grid grid, Config config, const Source* sources, int index, SourceRegion region, cudaStream_t stream);
     void apply_sources_forces(Grid grid, Config config, Fields destination, Fields forceFields, const Source* sources, const SourceRegion* regions, int count, float time, float dt, cudaStream_t stream);
-    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream);
-    void precondition(PressureWorkspace workspace, cudaStream_t stream);
+    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream);
     void assemble_pressure(Grid grid, Fields fields, PressureWorkspace workspace, float h, bool obstacles, bool rebuild, cudaStream_t stream);
     void coarse_matrix(PressureLevel fine, PressureLevel coarse, cudaStream_t stream);
     void begin_pressure(PressureWorkspace workspace, Config config, cudaStream_t stream);

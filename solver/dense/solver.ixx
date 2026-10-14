@@ -64,7 +64,7 @@ export namespace pyro::dense {
         cudaEvent_t events[9]{};
 
         template <typename T>
-        void allocate(T*& pointer, unsigned long long count);
+        void allocate(T*& pointer, unsigned long long count, bool clear = true);
         template <typename T>
         void release(T*& pointer, unsigned long long count);
         void project(cuda::dense::Fields fields);

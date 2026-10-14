@@ -69,7 +69,7 @@ def advance(scene, session):
             continue
         sources, colliders = [], []
         for i, obj in enumerate(session["objects"]):
-            _, active, rates, surface = mid[i]
+            _, active, values = mid[i]
             if not active:
                 continue
             derivative = (last[i][0] - first[i][0]) * (fps / (b - a))
@@ -77,10 +77,11 @@ def advance(scene, session):
             speed = np.linalg.norm(derivative @ session["corners"][i], axis=0).max()
             lower, upper = points.min(axis=1), points.max(axis=1)
             if obj.pyro.role == "COLLIDER":
+                surface = values[0]
                 lower, upper = lower - abs(surface), upper + abs(surface)
             motion = struct.pack("<i32f", i, *first[i][0].flat, *derivative.flat, (a-start)/fps, speed, *lower, *upper)
             if obj.pyro.role == "EMITTER":
-                sources.append(motion + struct.pack("<7f", *rates))
+                sources.append(motion + struct.pack("<7f", *values))
             else:
                 colliders.append(motion + struct.pack("<f", surface))
         session["solver"].stdin.write(b"A" + struct.pack("<dii", (b-start)/fps, len(sources), len(colliders)) + b"".join(sources + colliders))

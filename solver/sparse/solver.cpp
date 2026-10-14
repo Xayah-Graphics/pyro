@@ -30,13 +30,7 @@ namespace pyro::sparse {
     }
 
     void Solver::set_sources(const Source* data, int count) {
-        bool changed = sourceInputs.size() != static_cast<std::size_t>(count);
-        for (int i = 0; i < count && !changed; ++i) {
-            const auto& current  = data[i];
-            const auto& previous = sourceInputs[i];
-            changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.center != previous.center || current.halfExtent != previous.halfExtent || current.velocity != previous.velocity || current.smokeRate != previous.smokeRate || current.temperatureRate != previous.temperatureRate || current.velocityRate != previous.velocityRate || current.startTime != previous.startTime || current.endTime != previous.endTime || current.inheritVelocity != previous.inheritVelocity;
-            if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(current.motion.derivative, [](float value) { return value != 0; }) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
-        }
+        bool changed = sources_changed(std::span(data, static_cast<std::size_t>(count)), sourceInputs);
         if (!changed && sourceCount == count) return;
         topologyDirty |= changed;
         sourceInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
@@ -62,8 +56,8 @@ namespace pyro::sparse {
             if (!changed) {
                 const auto& previous = colliderInputs[i];
                 changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
-                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
-                else changed |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation || previous.linearVelocity != std::array<float, 3>{} || previous.angularVelocity != std::array<float, 3>{};
+                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || current.motion.maxSpeed != previous.motion.maxSpeed;
+                else changed |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation;
             }
         }
         changed |= movingGeometry;
@@ -71,6 +65,7 @@ namespace pyro::sparse {
         if (!changed && colliderCount == count) return;
         topologyDirty |= changed;
         geometryDirty |= changed;
+        grid.colliderSpeed = spare.colliderSpeed = collider_speed(std::span(data, static_cast<std::size_t>(count)));
         colliderInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
         if (count > colliderCapacity) {
             release(colliders, colliderCapacity);
@@ -110,7 +105,7 @@ namespace pyro::sparse {
         };
         auto measure = [&](bool full) {
             std::array<double, 6> result{};
-            cuda::sparse::measure(grid, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), full, pressure.reductions, stream);
+            cuda::sparse::measure(grid, parameters, sources, sourceCount, static_cast<float>(time), full, pressure.reductions, stream);
             int count = full ? 6 : 2;
             cuda_check(cudaMemcpyAsync(result.data(), pressure.reductions + grid.layout.count * static_cast<unsigned long long>(count), count * sizeof(double), cudaMemcpyDeviceToHost, stream));
             synchronize();
@@ -178,7 +173,7 @@ namespace pyro::sparse {
                 auto destination = stage ? grid.next : grid.midpoint;
                 auto carrier     = stage ? grid.midpoint : grid.state;
                 start();
-                cuda::sparse::advect(grid, destination, carrier, parameters, colliders, colliderCount, static_cast<float>(time), stageStep, stream);
+                cuda::sparse::advect(grid, destination, carrier, parameters, colliderCount != 0, static_cast<float>(time), stageStep, stream);
                 finish(statistics.advectionMilliseconds);
                 start();
                 cuda::sparse::forces(grid, destination, carrier, parameters, sources, sourceCount, static_cast<float>(time), stageStep, stream);
@@ -259,8 +254,10 @@ namespace pyro::sparse {
                 synchronize();
             }
             transfer(buffer.data(), buffer.size() * sizeof(float));
-            if (restore) cuda_check(cudaMemcpyAsync(pointer, buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-            synchronize();
+            if (restore) {
+                cuda_check(cudaMemcpyAsync(pointer, buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                synchronize();
+            }
         }
         // Input snapshots preserve adaptation scheduling across a restart while
         // still detecting a changed scene on the first upload after restore.
@@ -296,9 +293,9 @@ namespace pyro::sparse {
         return density;
     }
     template <typename T>
-    void Solver::allocate(T*& pointer, unsigned long long count) {
+    void Solver::allocate(T*& pointer, unsigned long long count, unsigned long long zeroFrom) {
         cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&pointer), count * sizeof(T), stream));
-        cuda_check(cudaMemsetAsync(pointer, 0, count * sizeof(T), stream));
+        if (zeroFrom < count) cuda_check(cudaMemsetAsync(pointer + zeroFrom, 0, (count - zeroFrom) * sizeof(T), stream));
         statistics.allocatedBytes += count * sizeof(T);
     }
     template <typename T>
@@ -318,7 +315,7 @@ namespace pyro::sparse {
         T* previous = pointer;
         pointer     = nullptr;
         try {
-            allocate(pointer, count);
+            allocate(pointer, count, retained);
             cuda_check(cudaMemcpyAsync(pointer, previous, retained * sizeof(T), cudaMemcpyDeviceToDevice, stream));
         } catch (...) {
             cudaFreeAsync(previous, stream);
@@ -469,7 +466,7 @@ namespace pyro::sparse {
     void Solver::project(cuda::sparse::Fields fields) {
         if (matrixDirty) build_pressure();
         cuda::sparse::assemble_rhs(grid, fields, pressure, stream);
-        cuda_check(cudaMemsetAsync(pressure.iteration, 0, sizeof(cuda::sparse::IterationState), stream));
+        cuda_check(cudaMemsetAsync(pressure.iteration, 0, sizeof(cuda::IterationState), stream));
         cuda::sparse::begin_pressure(grid, pressure, parameters, stream);
         if (!pressure.graph) {
             cudaGraph_t graph;
@@ -479,7 +476,7 @@ namespace pyro::sparse {
             cuda_check(cudaGraphInstantiate(&pressure.graph, graph, 0));
             cuda_check(cudaGraphDestroy(graph));
         }
-        cuda::sparse::IterationState status{};
+        cuda::IterationState status{};
         for (;;) {
             int remaining = config.pressureMaxIterations - status.iterations;
             if (remaining >= 8) cuda_check(cudaGraphLaunch(pressure.graph, stream));

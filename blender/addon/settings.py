@@ -17,7 +17,11 @@ CONFIG = {
             ("amr_smoke_error", "f"), ("amr_temperature_error", "f"), ("amr_velocity_error", "f"), ("amr_relative_error", "f"),
             ("smoke_threshold", "f"), ("temperature_threshold", "f"), ("velocity_threshold", "f")) + COMMON_CONFIG,
 }
-OBJECT_INPUTS = ("role", "active", "smoke_rate", "temperature_rate", "velocity_rate", "velocity", "velocity_space", "inherit_velocity", "surface_offset")
+OBJECT_INPUTS = {
+    "NONE": (),
+    "EMITTER": ("role", "active", "smoke_rate", "temperature_rate", "velocity_rate", "velocity", "velocity_space", "inherit_velocity"),
+    "COLLIDER": ("role", "active", "surface_offset"),
+}
 
 
 def enable_timeline(self, context):
@@ -40,6 +44,18 @@ def input_changed(self, context):
         for scene in bpy.data.scenes:
             if owner.name in scene.objects:
                 runtime.invalidate(scene)
+
+
+def object_input_changed(self, name):
+    from . import runtime
+    owner = self.id_data
+    for scene in bpy.data.scenes:
+        record = runtime.records.get(scene.as_pointer())
+        direct = owner.name in scene.objects and name in OBJECT_INPUTS[self.role]
+        # An otherwise unused property can still drive a simulation input.
+        dependent = record is not None and "pyro." + name in record["dependencies"].get(owner, ())
+        if direct or dependent:
+            runtime.invalidate(scene)
 
 
 def volume_object(self, obj):
@@ -106,14 +122,14 @@ class PYRO_PG_scene(bpy.types.PropertyGroup):
 
 class PYRO_PG_object(bpy.types.PropertyGroup):
     role: bpy.props.EnumProperty(name="Pyro Role", items=[("NONE", "None", "No simulation role; keep the mesh"), ("EMITTER", "Source", "Emit inside this closed mesh"), ("COLLIDER", "Collider", "One-way solid boundary")], options=set(), update=input_changed)
-    active: bpy.props.BoolProperty(name="Active", description="Participate in simulation at this time; can be keyframed independently of render visibility", default=True, update=input_changed)
-    smoke_rate: bpy.props.FloatProperty(name="Smoke Rate", description="Smoke density added per second inside the source", default=1, min=0, update=input_changed)
-    temperature_rate: bpy.props.FloatProperty(name="Temperature Rate", description="Temperature added per second inside the source; drives buoyancy", default=3, update=input_changed)
-    velocity_rate: bpy.props.FloatProperty(name="Velocity Strength", description="Exponential relaxation rate per second toward the source velocity; zero disables velocity injection", default=4, min=0, update=input_changed)
-    velocity: bpy.props.FloatVectorProperty(name="Velocity", description="Target source velocity in Blender units per second", default=(0, 0, 1.5), update=input_changed)
-    velocity_space: bpy.props.EnumProperty(name="Velocity Space", items=[("LOCAL", "Local", "Rotate velocity with the emitter"), ("WORLD", "World", "World-space velocity")], options=set(), update=input_changed)
-    inherit_velocity: bpy.props.FloatProperty(name="Inherit Motion", description="Amount of source transform velocity added to the injection velocity", default=1, min=0, update=input_changed)
-    surface_offset: bpy.props.FloatProperty(name="Surface Offset", description="Signed collider surface offset in Blender world units; positive expands the solid", default=0, subtype="DISTANCE", update=input_changed)
+    active: bpy.props.BoolProperty(name="Active", description="Participate in simulation at this time; can be keyframed independently of render visibility", default=True, update=lambda self, context: object_input_changed(self, "active"))
+    smoke_rate: bpy.props.FloatProperty(name="Smoke Rate", description="Smoke density added per second inside the source", default=1, min=0, update=lambda self, context: object_input_changed(self, "smoke_rate"))
+    temperature_rate: bpy.props.FloatProperty(name="Temperature Rate", description="Temperature added per second inside the source; drives buoyancy", default=3, update=lambda self, context: object_input_changed(self, "temperature_rate"))
+    velocity_rate: bpy.props.FloatProperty(name="Velocity Strength", description="Exponential relaxation rate per second toward the source velocity; zero disables velocity injection", default=4, min=0, update=lambda self, context: object_input_changed(self, "velocity_rate"))
+    velocity: bpy.props.FloatVectorProperty(name="Velocity", description="Target source velocity in Blender units per second", default=(0, 0, 1.5), update=lambda self, context: object_input_changed(self, "velocity"))
+    velocity_space: bpy.props.EnumProperty(name="Velocity Space", items=[("LOCAL", "Local", "Rotate velocity with the emitter"), ("WORLD", "World", "World-space velocity")], options=set(), update=lambda self, context: object_input_changed(self, "velocity_space"))
+    inherit_velocity: bpy.props.FloatProperty(name="Inherit Motion", description="Amount of source transform velocity added to the injection velocity", default=1, min=0, update=lambda self, context: object_input_changed(self, "inherit_velocity"))
+    surface_offset: bpy.props.FloatProperty(name="Surface Offset", description="Signed collider surface offset in Blender world units; positive expands the solid", default=0, subtype="DISTANCE", update=lambda self, context: object_input_changed(self, "surface_offset"))
 
 
 def register():

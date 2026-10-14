@@ -23,7 +23,7 @@ def participants(scene):
 
 def dependencies(objects):
     paths = {}
-    pending = [(obj, set(TRANSFORMS) | {"pyro." + name for name in OBJECT_INPUTS}) for obj in objects]
+    pending = [(obj, set(TRANSFORMS) | {"pyro." + name for name in OBJECT_INPUTS[obj.pyro.role]}) for obj in objects]
     while pending:
         obj, required = pending.pop()
         watched = paths.setdefault(obj, set())
@@ -178,9 +178,12 @@ def sample(scene, objects, frame):
     for obj in objects:
         evaluated = obj.evaluated_get(graph)
         props = evaluated.pyro
-        velocity = props.velocity[:]
-        if props.velocity_space == "LOCAL":
-            velocity = evaluated.matrix_world.to_quaternion() @ Vector(velocity)
-        result.append((np.array(evaluated.matrix_world, dtype=np.float64)[:3], props.active,
-            (props.smoke_rate, props.temperature_rate, props.velocity_rate, *velocity, props.inherit_velocity), props.surface_offset))
+        if props.role == "EMITTER":
+            velocity = props.velocity[:]
+            if props.velocity_space == "LOCAL":
+                velocity = evaluated.matrix_world.to_quaternion() @ Vector(velocity)
+            values = (props.smoke_rate, props.temperature_rate, props.velocity_rate, *velocity, props.inherit_velocity)
+        else:
+            values = (props.surface_offset,)
+        result.append((np.array(evaluated.matrix_world, dtype=np.float64)[:3], props.active, values))
     return result
