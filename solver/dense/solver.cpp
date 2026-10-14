@@ -2,13 +2,11 @@ module;
 #include "cuda.cuh"
 module pyro.dense;
 import std;
+import pyro.geometry;
 namespace pyro::dense {
     static_assert(sizeof(Config) == sizeof(cuda::dense::Config));
     static_assert(sizeof(Motion) == sizeof(cuda::Motion));
     static_assert(sizeof(Triangle) == sizeof(cuda::Triangle));
-    static void cuda_check(cudaError_t result) {
-        if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
-    }
 
     Solver::Solver(const Config& settings) : config(settings), parameters(std::bit_cast<cuda::dense::Config>(settings)) {
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -98,22 +96,10 @@ namespace pyro::dense {
         }
         std::vector<cuda::Source> upload(count);
         for (int i = 0; i < count; ++i) {
-            const auto& source     = data[i];
-            auto& target           = upload[i];
-            target.center          = std::bit_cast<float3>(source.center);
-            target.halfExtent      = std::bit_cast<float3>(source.halfExtent);
-            target.velocity        = std::bit_cast<float3>(source.velocity);
-            target.smokeRate       = source.smokeRate;
-            target.temperatureRate = source.temperatureRate;
-            target.velocityRate    = source.velocityRate;
-            target.startTime       = source.startTime;
-            target.endTime         = source.endTime;
-            target.shape           = static_cast<cuda::Shape>(source.shape);
-            target.mesh            = source.shape == Shape::mesh ? meshes[source.mesh] : cuda::Mesh{};
-            target.motion          = std::bit_cast<cuda::Motion>(source.motion);
-            target.inheritVelocity = source.inheritVelocity;
-            auto& region           = sourceRegions[i];
-            region.cached          = source.shape != Shape::mesh || std::ranges::all_of(source.motion.derivative, [](float d) { return d == 0; });
+            const auto& source = data[i];
+            upload[i]          = device_input(source, meshes);
+            auto& region       = sourceRegions[i];
+            region.cached      = source.shape != Shape::mesh || std::ranges::all_of(source.motion.derivative, [](float d) { return d == 0; });
             cuda::Bounds bounds;
             if (source.shape == Shape::mesh) bounds = std::bit_cast<cuda::Bounds>(source.motion.swept);
             else {
@@ -181,42 +167,15 @@ namespace pyro::dense {
         colliderCount = count;
         if (!count) return;
         std::vector<cuda::Collider> upload(count);
-        for (int i = 0; i < count; ++i) {
-            const auto& collider   = data[i];
-            auto& target           = upload[i];
-            target.center          = std::bit_cast<float3>(collider.center);
-            target.halfExtent      = std::bit_cast<float3>(collider.halfExtent);
-            target.orientation     = std::bit_cast<float4>(collider.orientation);
-            target.linearVelocity  = std::bit_cast<float3>(collider.linearVelocity);
-            target.angularVelocity = std::bit_cast<float3>(collider.angularVelocity);
-            target.poseTime        = collider.poseTime;
-            target.shape           = static_cast<cuda::Shape>(collider.shape);
-            target.mesh            = collider.shape == Shape::mesh ? meshes[collider.mesh] : cuda::Mesh{};
-            target.motion          = std::bit_cast<cuda::Motion>(collider.motion);
-            target.surfaceOffset   = collider.surfaceOffset;
-        }
+        for (int i = 0; i < count; ++i) upload[i] = device_input(data[i], meshes);
         cuda_check(cudaMemcpyAsync(colliders, upload.data(), count * sizeof(cuda::Collider), cudaMemcpyHostToDevice, stream));
         synchronize();
     }
 
     int Solver::add_mesh(std::span<const Triangle> triangles) {
-        cuda::Mesh mesh;
-        mesh.triangleCount = static_cast<int>(triangles.size());
-        mesh.leafCount     = static_cast<int>(std::bit_ceil(triangles.size()));
-        mesh.band          = config.cellSize * 4.0f;
-        mesh.bounds        = {{1.0e30f, 1.0e30f, 1.0e30f}, {-1.0e30f, -1.0e30f, -1.0e30f}};
-        for (auto t : triangles)
-            for (auto p : {t.a, t.b, t.c}) {
-                mesh.bounds.lower = {std::min(mesh.bounds.lower.x, p[0]), std::min(mesh.bounds.lower.y, p[1]), std::min(mesh.bounds.lower.z, p[2])};
-                mesh.bounds.upper = {std::max(mesh.bounds.upper.x, p[0]), std::max(mesh.bounds.upper.y, p[1]), std::max(mesh.bounds.upper.z, p[2])};
-            }
-        allocate(mesh.triangles, mesh.triangleCount);
-        allocate(mesh.order, mesh.triangleCount);
-        allocate(mesh.nodes, mesh.leafCount * 2);
-        cuda_check(cudaMemcpyAsync(mesh.triangles, triangles.data(), triangles.size_bytes(), cudaMemcpyHostToDevice, stream));
-        cuda::build_mesh(mesh, stream);
-        synchronize();
+        auto mesh = upload_mesh(triangles, config.cellSize * 4, stream);
         meshes.push_back(mesh);
+        statistics.allocatedBytes += triangles.size() * (sizeof(cuda::Triangle) + sizeof(int)) + mesh.leafCount * 2ull * sizeof(cuda::Bounds);
         return static_cast<int>(meshes.size()) - 1;
     }
 
@@ -268,14 +227,14 @@ namespace pyro::dense {
                 matrixDirty   = true;
             }
             cuda_check(cudaEventRecord(events[1], stream));
-            cuda_check(cudaEventRecord(events[8], stream));
+            cuda_check(cudaEventRecord(events[7], stream));
             cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, false, stream);
-            cuda_check(cudaEventRecord(events[9], stream));
+            cuda_check(cudaEventRecord(events[8], stream));
             float bounds[2];
             cuda_check(cudaMemcpyAsync(bounds, maximum, sizeof(bounds), cudaMemcpyDeviceToHost, stream));
             synchronize();
             statistics.geometryMilliseconds += elapsed(0, 1);
-            statistics.statisticsMilliseconds += elapsed(8, 9);
+            statistics.statisticsMilliseconds += elapsed(7, 8);
             float distance        = config.cfl * config.cellSize;
             float safeStep        = 2.0f * distance / (bounds[0] + std::sqrt(bounds[0] * bounds[0] + 4.0f * bounds[1] * distance) + 1.0e-20f);
             float dt              = static_cast<float>(std::min(endTime - time, static_cast<double>(std::min(config.maxTimeStep, safeStep))));
@@ -312,13 +271,13 @@ namespace pyro::dense {
             time += dt;
             ++statistics.substeps;
         }
-        cuda_check(cudaEventRecord(events[8], stream));
+        cuda_check(cudaEventRecord(events[7], stream));
         cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, true, stream);
-        cuda_check(cudaEventRecord(events[9], stream));
+        cuda_check(cudaEventRecord(events[8], stream));
         double result[6];
         cuda_check(cudaMemcpyAsync(result, pressure.reductions + grid.layout.blocks * 6ull, sizeof(result), cudaMemcpyDeviceToHost, stream));
         synchronize();
-        statistics.statisticsMilliseconds += elapsed(8, 9);
+        statistics.statisticsMilliseconds += elapsed(7, 8);
         statistics.fluidCells          = static_cast<int>(result[0]);
         statistics.maxDivergence       = static_cast<float>(result[1]);
         statistics.maxSpeed            = static_cast<float>(result[2]);
@@ -341,6 +300,10 @@ namespace pyro::dense {
             if (restore) file.read(static_cast<char*>(data), bytes);
             else file.write(static_cast<const char*>(data), bytes);
         };
+        constexpr std::array format{'P', 'Y', 'R', 'O', 'D', 'N', '0', '1'};
+        auto storedFormat = format;
+        transfer(storedFormat.data(), storedFormat.size());
+        if (storedFormat != format) throw std::runtime_error("Unsupported dense checkpoint format");
         transfer(&time, sizeof(time));
         std::vector<float> buffer(grid.layout.cells);
         float* fields[]{grid.state.smoke, grid.state.temperature, grid.state.velocity[0], grid.state.velocity[1], grid.state.velocity[2]};
@@ -399,8 +362,6 @@ namespace pyro::dense {
         cuda::dense::begin_pressure(workspace, parameters, stream);
         auto executable = workspace.graph;
         if (!executable) {
-            if (executable) cuda_check(cudaGraphExecDestroy(executable));
-            workspace.graph = nullptr;
             cudaGraph_t graph;
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
             for (int iteration = 0; iteration < 8; ++iteration) cuda::dense::iterate_pressure(workspace, parameters, stream);

@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "pyro_solver"
+version = "1.0.0"
+name = "Pyro Solver"
+tagline = "Adaptive sparse and dense CUDA smoke simulation"
+maintainer = "Pyro"
+type = "add-on"
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-only"]
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Run the local solver and read and write simulation caches"

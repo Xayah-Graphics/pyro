@@ -5,6 +5,8 @@ file(MAKE_DIRECTORY "${PYRO_ADDON_STAGE}/bin")
 add_custom_target(pyro_blender
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
         "${CMAKE_SOURCE_DIR}/blender/addon/__init__.py"
+        "${CMAKE_SOURCE_DIR}/blender/addon/operators.py"
+        "${CMAKE_SOURCE_DIR}/blender/addon/ui.py"
         "${CMAKE_SOURCE_DIR}/blender/addon/process.py"
         "${CMAKE_SOURCE_DIR}/blender/addon/settings.py"
         "${CMAKE_SOURCE_DIR}/blender/addon/inputs.py"
@@ -16,7 +18,7 @@ add_custom_target(pyro_blender
         "${PYRO_ADDON_STAGE}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:pyro>" "${PYRO_CUDART_DLL}" "${PYRO_ADDON_STAGE}/bin"
     COMMAND "${CMAKE_COMMAND}" -E tar cf "${CMAKE_BINARY_DIR}/pyro_blender.zip" --format=zip
-        __init__.py process.py settings.py inputs.py runtime.py bridge.py grid_view.py blender_manifest.toml LICENSE bin
+        __init__.py operators.py ui.py process.py settings.py inputs.py runtime.py bridge.py grid_view.py blender_manifest.toml LICENSE bin
     DEPENDS pyro
     WORKING_DIRECTORY "${PYRO_ADDON_STAGE}"
     VERBATIM

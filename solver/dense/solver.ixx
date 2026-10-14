@@ -61,7 +61,7 @@ export namespace pyro::dense {
         bool geometryDirty{true}, matrixDirty{true};
         float* maximum{};
         std::vector<float> density;
-        cudaEvent_t events[10]{};
+        cudaEvent_t events[9]{};
 
         template <typename T>
         void allocate(T*& pointer, unsigned long long count);

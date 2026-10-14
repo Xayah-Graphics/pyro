@@ -1,66 +1,10 @@
 #include "cuda.cuh"
+#include <cub/cub.cuh>
 
-namespace pyro::cuda {
-    __device__ float matrix_product(PressureLevel level, const float* x, int i) {
-        // Flux differences preserve the constant nullspace in FP32. Expanding
-        // diag*x - sum(face*x_neighbor) loses accuracy for smooth pressures.
-        float result = level.boundary[i] * x[i];
-        for (int axis = 0; axis < 3; ++axis) {
-            int a = neighbor(level.layout, i, axis, -1), b = neighbor(level.layout, i, axis, 1);
-            result += level.face[axis][i] * (x[i] - value(x, a));
-            result += value(level.face[axis], b) * (x[i] - value(x, b));
-        }
-        return result;
-    }
-
-    template <bool rebuild>
-    __global__ void assemble_fine(Grid grid, Fields fields, PressureLevel level, float h, int* parents, int* open, unsigned char* anchors, float* solution, float* residual) {
-        int id      = grid.layout.active[blockIdx.x];
-        float scale = 1.0f / (h * h);
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i          = id * blockCells + local;
-            float diagonal = 0.0f, boundary = 0.0f, divergence = -grid.solidDivergence[i];
-            bool isOpen = false;
-            if constexpr (rebuild) {
-                parents[i] = i;
-                open[i]    = 0;
-                anchors[i] = 0;
-            }
-            solution[i] = 0.0f;
-            for (int axis = 0; axis < 3; ++axis) {
-                int previous = neighbor(grid.layout, i, axis, -1);
-                if constexpr (rebuild) level.face[axis][i] = grid.fluid[i] && previous >= 0 && grid.fluid[previous] ? grid.aperture[axis][i] * scale : 0.0f;
-                for (int sign = -1; sign <= 1; sign += 2) {
-                    int adjacent        = neighbor(grid.layout, i, axis, sign);
-                    int face            = sign < 0 ? i : adjacent;
-                    float aperture      = value(grid.aperture[axis], face, 1.0f);
-                    float fluidVelocity = value(fields.velocity[axis], face);
-                    float solidVelocity = value(grid.solidVelocity[axis], face);
-                    divergence += sign * (aperture * fluidVelocity + (1.0f - aperture) * solidVelocity) / h;
-                    if constexpr (rebuild) {
-                        if (adjacent >= 0 && grid.fluid[adjacent]) diagonal += aperture * scale;
-                        else if (adjacent < 0 || !(grid.roles[adjacent >> 9] & 2u)) {
-                            diagonal += 2.0f * aperture * scale;
-                            boundary += 2.0f * aperture * scale;
-                            isOpen = isOpen || aperture > 0.0f;
-                        }
-                    }
-                }
-            }
-            if constexpr (rebuild) {
-                level.diagonal[i]  = grid.fluid[i] ? diagonal : 0.0f;
-                level.boundary[i]  = grid.fluid[i] ? boundary : 0.0f;
-                level.temporary[i] = isOpen && grid.fluid[i] ? 1.0f : 0.0f;
-            }
-            level.rhs[i] = grid.fluid[i] && !anchors[i] ? -divergence : 0.0f;
-            residual[i]  = level.rhs[i];
-        }
-    }
-
-    __device__ int root(int* parents, int i) {
+namespace pyro::cuda::sparse {
+    __device__ int component_root(int* parents, int i) {
         int p = atomicAdd(parents + i, 0);
         while (p != i) {
-            // Parent labels only decrease during concurrent union and path splitting.
             int next = atomicAdd(parents + p, 0);
             atomicMin(parents + i, next);
             i = p;
@@ -68,215 +12,421 @@ namespace pyro::cuda {
         }
         return i;
     }
-
-    __global__ void connect_components(PressureLevel level, const unsigned char* fluid, int* parents) {
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            if (!fluid[i]) continue;
-            for (int axis = 0; axis < 3; ++axis) {
-                if (level.face[axis][i] <= 0.0f) continue;
-                int j = neighbor(level.layout, i, axis, -1);
-                int a = root(parents, i), b = root(parents, j);
-                while (a != b) {
-                    int high = max(a, b), low = min(a, b);
-                    int old = atomicCAS(parents + high, high, low);
-                    if (old == high) break;
-                    a = root(parents, old);
-                    b = root(parents, low);
-                }
-            }
+    // Level descriptors are host data; kernels receive individual descriptors.
+    __global__ void initialize_fine(Grid grid, PressureLevel fine, int* parents, int* open, unsigned char* anchors) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= fine.count) return;
+        parents[i]    = i;
+        open[i]       = 0;
+        anchors[i]    = 0;
+        fine.nodes[i] = {cell_coordinate(grid.layout, i), grid.layout.blocks[i >> 9].level};
+    }
+    __global__ void connect_components(Grid grid, int* parents) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= grid.layout.count * 1728) return;
+        Face face = grid.faces[f];
+        if (face.weight <= 0 || face.left < 0 || face.right < 0) return;
+        int a = component_root(parents, face.left), b = component_root(parents, face.right);
+        while (a != b) {
+            int high = max(a, b), low = min(a, b);
+            int old = atomicCAS(parents + high, high, low);
+            if (old == high) break;
+            a = component_root(parents, old);
+            b = component_root(parents, low);
         }
     }
-
-    __global__ void mark_components(PressureLevel level, int* parents, int* open) {
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            int r = root(parents, i);
-            atomicExch(parents + i, r);
-            if (level.temporary[i] > 0.0f) atomicExch(open + r, 1);
+    __global__ void mark_open(Grid grid, int* parents, int* open) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.count * 512) return;
+        int root = component_root(parents, i);
+        atomicExch(parents + i, root);
+        for (int a = 0; a < 3; ++a)
+            for (int sign = -1; sign <= 1; sign += 2)
+                for (int f : cell_faces(grid, i, a, sign).face)
+                    if (f >= 0 && grid.faces[f].weight > 0 && (grid.faces[f].left < 0 || grid.faces[f].right < 0)) atomicExch(open + root, 1);
+    }
+    __global__ void mark_anchors(Grid grid, const int* parents, const int* open, unsigned char* anchors, IterationState* state) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.count * 512) return;
+        anchors[i] = grid.fluid[i] && parents[i] == i && !open[i];
+        if (anchors[i]) atomicAdd(&state->iterations, 1);
+    }
+    __device__ int interface_edge(Grid grid, int group, int a, int b) {
+        int low = min(a, b), high = max(a, b);
+        return grid.layout.count * 1728 + group * 6 + low * 3 - low * (low - 1) / 2 + high - low - 1;
+    }
+    // A coarse face uses the area-weighted pressure of its four fine neighbors.
+    // Its energy is W * (p_coarse - sum(w_i*p_i)/W)^2. The negative peer
+    // edges below express that positive semidefinite rank-one term exactly;
+    // they are intentional and must survive Galerkin coarsening.
+    __device__ Edge physical_edge(Grid grid, int f) {
+        int count = grid.layout.count * 1728;
+        if (f < count) {
+            Face face = grid.faces[f];
+            return {face.left, face.right, face.weight};
         }
+        int group = (f - count) / 6, pair = (f - count) % 6;
+        Links links = grid.links[group];
+        if (links.face[3] < 0) return {-1, -1, 0};
+        constexpr int pairs[6][2]{{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+        Face a = grid.faces[links.face[pairs[pair][0]]], b = grid.faces[links.face[pairs[pair][1]]];
+        int left    = spacing(grid.layout, a.left) < spacing(grid.layout, a.right) ? a.left : a.right;
+        int right   = spacing(grid.layout, b.left) < spacing(grid.layout, b.right) ? b.left : b.right;
+        float total = 0;
+        for (int face : links.face) total += grid.faces[face].weight;
+        return {left, right, total > 0 ? -a.weight * b.weight / total : 0};
     }
-
-    __global__ void anchor_components(PressureLevel level, const unsigned char* fluid, int* parents, const int* open, unsigned char* anchors, float* residual) {
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i       = id * blockCells + local;
-            int r       = parents[i];
-            bool anchor = fluid[i] && !open[r] && r == i;
-            anchors[i]  = anchor;
-            if (anchor) {
-                level.diagonal[i] = 1.0f;
-                level.boundary[i] = 1.0f;
-                level.rhs[i]      = 0.0f;
-                residual[i]       = 0.0f;
-            }
-        }
+    __global__ void fine_edges(Grid grid, PressureLevel fine, const unsigned char* anchors) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= fine.edgeCount) return;
+        Edge edge = physical_edge(grid, f);
+        if (edge.left < 0 || edge.right < 0 || anchors[edge.left] || anchors[edge.right]) edge.weight = 0;
+        fine.edges[f] = edge;
+        if (f < grid.layout.count * 1728) fine.faceWeights[f] = edge.weight;
     }
-
-    __global__ void anchor_faces(PressureLevel level, const unsigned char* anchors) {
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            for (int axis = 0; axis < 3; ++axis) {
-                int j = neighbor(level.layout, i, axis, -1);
-                if (anchors[i] || (j >= 0 && anchors[j])) {
-                    float weight = level.face[axis][i];
-                    if (!anchors[i]) atomicAdd(level.boundary + i, weight);
-                    if (j >= 0 && !anchors[j]) atomicAdd(level.boundary + j, weight);
-                    level.face[axis][i] = 0.0f;
-                }
-            }
-        }
-    }
-
-    __global__ void coarse_keys(Layout fine, Layout coarse) {
-        int index = blockIdx.x * blockDim.x + threadIdx.x;
-        if (index >= fine.blocks) return;
-        int3 p      = fine.coordinates[fine.active[index]];
-        auto wanted = key({p.x >> 1, p.y >> 1, p.z >> 1});
-        int slot    = hash_slot(wanted, coarse.tableCapacity);
-        for (;;) {
-            auto old = atomicCAS(coarse.keys + slot, emptyKey, wanted);
-            if (old == emptyKey || old == wanted) return;
-            slot = (slot + 1) & (coarse.tableCapacity - 1);
-        }
-    }
-
-    __global__ void coarse_indices(Layout coarse) {
-        int slot = blockIdx.x * blockDim.x + threadIdx.x;
-        if (slot >= coarse.tableCapacity || coarse.keys[slot] == emptyKey) return;
-        int id                 = atomicAdd(coarse.count, 1);
-        coarse.indices[slot]   = id;
-        coarse.active[id]      = id;
-        coarse.coordinates[id] = coordinate(coarse.keys[slot]);
-    }
-
-    __global__ void coarsen_matrix(PressureLevel fine, PressureLevel coarse) {
-        int id = coarse.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i          = id * blockCells + local;
-            int3 c         = cell_coordinate(coarse.layout, i);
-            float diagonal = 0.0f, boundary = 0.0f;
-            float faces[3]{};
-            // P is piecewise constant, R = transpose(P). Sum only external
-            // faces; do not subtract large internal diagonal contributions.
-            for (int z = 0; z < 2; ++z)
-                for (int y = 0; y < 2; ++y)
-                    for (int x = 0; x < 2; ++x) {
-                        int j = cell_index(fine.layout, {2 * c.x + x, 2 * c.y + y, 2 * c.z + z});
-                        if (j < 0) continue;
-                        boundary += fine.boundary[j];
-                        int parity[]{x, y, z};
-                        for (int axis = 0; axis < 3; ++axis) {
-                            if (parity[axis]) diagonal += value(fine.face[axis], neighbor(fine.layout, j, axis, 1));
-                            else {
-                                faces[axis] += fine.face[axis][j];
-                                diagonal += fine.face[axis][j];
-                            }
+    __global__ void fine_diagonal(Grid grid, PressureLevel fine, const unsigned char* anchors) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= fine.count) return;
+        double diagonal = 0, boundary = 0;
+        for (int a = 0; a < 3; ++a)
+            for (int sign = -1; sign <= 1; sign += 2)
+                for (int f : cell_faces(grid, i, a, sign).face)
+                    if (f >= 0) {
+                        Face face = grid.faces[f];
+                        int j     = face.left == i ? face.right : face.left;
+                        diagonal += face.weight;
+                        if (j < 0 || anchors[j]) boundary += face.weight;
+                        if (face.group >= 0 && spacing(grid.layout, i) < spacing(grid.layout, j)) {
+                            Links group = grid.links[face.group];
+                            int ordinal = 0;
+                            while (group.face[ordinal] != f) ++ordinal;
+                            for (int q = 0; q < 4; ++q)
+                                if (q != ordinal) {
+                                    Edge edge    = physical_edge(grid, interface_edge(grid, face.group, ordinal, q));
+                                    int neighbor = edge.left == i ? edge.right : edge.left;
+                                    diagonal += edge.weight;
+                                    if (anchors[neighbor]) boundary += edge.weight;
+                                }
                         }
                     }
-            coarse.diagonal[i] = diagonal + boundary;
-            coarse.boundary[i] = boundary;
-            for (int axis = 0; axis < 3; ++axis) coarse.face[axis][i] = faces[axis];
+        fine.boundary[i] = anchors[i] ? 1 : grid.fluid[i] ? float(boundary) : 0;
+        fine.diagonal[i] = anchors[i] ? 1 : grid.fluid[i] ? float(diagonal) : 0;
+    }
+    bool fine_matrix(Grid grid, PressureWorkspace workspace, bool obstacles, cudaStream_t stream) {
+        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(IterationState), stream));
+        auto fine = workspace.levels[0];
+        initialize_fine<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.components, workspace.open, workspace.anchors);
+        if (obstacles) {
+            connect_components<<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, workspace.components);
+            mark_open<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, workspace.components, workspace.open);
+            mark_anchors<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, workspace.components, workspace.open, workspace.anchors, workspace.iteration);
+        }
+        fine_edges<<<(fine.edgeCount + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.anchors);
+        fine_diagonal<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.anchors);
+        int closed = 0;
+        if (obstacles) {
+            cuda_check(cudaMemcpyAsync(&closed, &workspace.iteration->iterations, sizeof(int), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+        }
+        return closed != 0;
+    }
+    __global__ void parent_keys(PressureLevel fine, unsigned long long* keys, int depth) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= fine.count) return;
+        Node n    = fine.nodes[i];
+        int shift = max(0, depth - n.level);
+        keys[i]   = key({n.coordinate.x >> shift, n.coordinate.y >> shift, n.coordinate.z >> shift}, max(depth, n.level));
+    }
+    __global__ void unpack_nodes(PressureLevel coarse, const unsigned long long* keys) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < coarse.count) coarse.nodes[i] = node(keys[i]);
+    }
+    __global__ void link_parents(PressureLevel fine, PressureLevel coarse, const unsigned long long* keys, int depth) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= fine.count) return;
+        Node n    = fine.nodes[i];
+        int shift = max(0, depth - n.level);
+        auto k    = key({n.coordinate.x >> shift, n.coordinate.y >> shift, n.coordinate.z >> shift}, max(depth, n.level));
+        int low = 0, high = coarse.count;
+        while (low < high) {
+            int middle = (low + high) / 2;
+            if (keys[middle] < k) low = middle + 1;
+            else high = middle;
+        }
+        fine.parent[i]                   = low;
+        int child                        = shift ? (n.coordinate.x & 1) + 2 * (n.coordinate.y & 1) + 4 * (n.coordinate.z & 1) : 0;
+        coarse.children[low * 8 + child] = i;
+    }
+    int coarse_nodes(PressureLevel fine, PressureLevel coarse, Scratch scratch, int depth, cudaStream_t stream) {
+        int count = coarse.count;
+        if (!coarse.nodes) {
+            parent_keys<<<(fine.count + 255) / 256, 256, 0, stream>>>(fine, scratch.keys[0], depth);
+            std::size_t bytes = scratch.sortBytes;
+            cuda_check(cub::DeviceRadixSort::SortKeys(scratch.sortStorage, bytes, scratch.keys[0], scratch.keys[1], fine.count, 0, 64, stream));
+            bytes = scratch.sortBytes;
+            cuda_check(cub::DeviceSelect::Unique(scratch.sortStorage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.count, stream));
+            cuda_check(cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+            return count;
+        }
+        coarse.count = count;
+        cuda_check(cudaMemsetAsync(coarse.children, 255, count * 8ull * sizeof(int), stream));
+        unpack_nodes<<<(count + 255) / 256, 256, 0, stream>>>(coarse, scratch.keys[2]);
+        link_parents<<<(fine.count + 255) / 256, 256, 0, stream>>>(fine, coarse, scratch.keys[2], depth);
+        return count;
+    }
+    __global__ void edge_keys(PressureLevel fine, unsigned long long* keys, float* values) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= fine.edgeCount) return;
+        Edge edge            = fine.edges[f];
+        unsigned long long k = emptyKey;
+        float value          = 0;
+        if (edge.weight != 0 && edge.left >= 0 && edge.right >= 0) {
+            int a = fine.parent[edge.left], b = fine.parent[edge.right];
+            if (a != b) {
+                k     = (static_cast<unsigned long long>(min(a, b)) << 32) | unsigned(max(a, b));
+                value = edge.weight;
+            }
+        }
+        keys[f]   = k;
+        values[f] = value;
+    }
+    __global__ void reduce_edges(PressureLevel coarse, const unsigned long long* sorted, const float* values, const unsigned long long* unique, int count) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= coarse.edgeCount) return;
+        auto k  = unique[f];
+        int low = 0, high = count;
+        while (low < high) {
+            int middle = (low + high) / 2;
+            if (sorted[middle] < k) low = middle + 1;
+            else high = middle;
+        }
+        double sum = 0;
+        for (int j = low; j < count && sorted[j] == k; ++j) sum += values[j];
+        Edge edge{int(k >> 32), int(k & 0xffffffff), float(sum)};
+        coarse.edges[f] = edge;
+        for (int i : {edge.left, edge.right}) {
+            bool inserted = false;
+            for (int j = 0; j < 24; ++j)
+                if (atomicCAS(coarse.adjacency + j * coarse.count + i, -1, f) == -1) {
+                    inserted = true;
+                    break;
+                }
+            if (!inserted) __trap();
         }
     }
-
-    __global__ void zero_solution(PressureLevel level, const IterationState* state) {
-        if (state->converged || state->failed) return;
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) level.solution[id * blockCells + local] = 0.0f;
-    }
-
-    __global__ void smooth(PressureLevel level, const float* rhs, int color, const IterationState* state) {
-        if (state->converged || state->failed) return;
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            if (((local + (local >> 3) + (local >> 6)) & 1) != color) continue;
-            int i          = id * blockCells + local;
-            float diagonal = level.diagonal[i];
-            if (diagonal > 0.0f) level.solution[i] += (rhs[i] - matrix_product(level, level.solution, i)) / diagonal;
+    __global__ void coarse_diagonal(PressureLevel fine, PressureLevel coarse) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= coarse.count) return;
+        int row[24];
+        for (int j = 0; j < 24; ++j) row[j] = coarse.adjacency[j * coarse.count + i];
+        for (int j = 1; j < 24; ++j) {
+            int value = row[j], k = j;
+            if (value < 0) continue;
+            while (k && (row[k - 1] < 0 || row[k - 1] > value)) {
+                row[k] = row[k - 1];
+                --k;
+            }
+            row[k] = value;
         }
+        for (int j = 0; j < 24; ++j) coarse.adjacency[j * coarse.count + i] = row[j];
+        double boundary = 0, diagonal = 0;
+        for (int c = 0; c < 8; ++c) {
+            int child = coarse.children[i * 8 + c];
+            if (child >= 0) boundary += fine.boundary[child];
+        }
+        for (int j = 0; j < 24 && row[j] >= 0; ++j) diagonal += coarse.edges[row[j]].weight;
+        coarse.boundary[i] = float(boundary);
+        coarse.diagonal[i] = float(boundary + diagonal);
     }
-
-    __global__ void restrict_residual(PressureLevel fine, PressureLevel coarse, const float* rhs, const IterationState* state) {
-        if (state->converged || state->failed) return;
-        int id = coarse.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i     = id * blockCells + local;
-            int3 c    = cell_coordinate(coarse.layout, i);
-            float sum = 0.0f;
-            for (int z = 0; z < 2; ++z)
-                for (int y = 0; y < 2; ++y)
-                    for (int x = 0; x < 2; ++x) {
-                        int j = cell_index(fine.layout, {2 * c.x + x, 2 * c.y + y, 2 * c.z + z});
-                        if (j >= 0 && fine.diagonal[j] > 0.0f) sum += rhs[j] - matrix_product(fine, fine.solution, j);
+    int coarse_edges(PressureLevel fine, PressureLevel coarse, Scratch scratch, cudaStream_t stream) {
+        int count = 0;
+        if (fine.edgeCount) {
+            edge_keys<<<(fine.edgeCount + 255) / 256, 256, 0, stream>>>(fine, scratch.keys[0], scratch.values[0]);
+            std::size_t bytes = scratch.sortBytes;
+            cuda_check(cub::DeviceRadixSort::SortPairs(scratch.sortStorage, bytes, scratch.keys[0], scratch.keys[1], scratch.values[0], scratch.values[1], fine.edgeCount, 0, 64, stream));
+            bytes = scratch.sortBytes;
+            cuda_check(cub::DeviceSelect::Unique(scratch.sortStorage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.edgeCount, stream));
+            cuda_check(cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+            unsigned long long last;
+            cuda_check(cudaMemcpyAsync(&last, scratch.keys[2] + count - 1, sizeof(last), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaStreamSynchronize(stream));
+            if (last == emptyKey) --count;
+        }
+        coarse.edgeCount = count;
+        cuda_check(cudaMemsetAsync(coarse.adjacency, 255, coarse.count * 24ull * sizeof(int), stream));
+        if (count) reduce_edges<<<(count + 255) / 256, 256, 0, stream>>>(coarse, scratch.keys[1], scratch.values[1], scratch.keys[2], fine.edgeCount);
+        coarse_diagonal<<<(coarse.count + 255) / 256, 256, 0, stream>>>(fine, coarse);
+        return count;
+    }
+    template <typename T>
+    __device__ T matrix_product(Grid grid, PressureLevel level, const T* x, int i, bool fine) {
+        if (level.diagonal[i] <= 0) return 0;
+        T result = level.boundary[i] * x[i];
+        if (fine) {
+            for (int a = 0; a < 3; ++a)
+                for (int sign = -1; sign <= 1; sign += 2) {
+                    int coordinate = (i >> (3 * a)) & 7, stride = 1 << (3 * a);
+                    if (coordinate + sign >= 0 && coordinate + sign < 8) {
+                        int f = negative_face(i + (sign > 0 ? stride : 0), a);
+                        result += level.faceWeights[f] * (x[i] - x[i + sign * stride]);
+                        continue;
                     }
-            coarse.rhs[i] = sum;
-        }
+                    for (int f : cell_faces(grid, i, a, sign).face)
+                        if (f >= 0) {
+                            Edge edge = level.edges[f];
+                            if (edge.weight != 0) result += edge.weight * (x[i] - x[edge.left == i ? edge.right : edge.left]);
+                            Face face = grid.faces[f];
+                            int other = face.left == i ? face.right : face.left;
+                            if (face.group >= 0 && spacing(grid.layout, i) < spacing(grid.layout, other)) {
+                                Links group = grid.links[face.group];
+                                int ordinal = 0;
+                                while (group.face[ordinal] != f) ++ordinal;
+                                for (int q = 0; q < 4; ++q)
+                                    if (q != ordinal) {
+                                        Edge peer = level.edges[interface_edge(grid, face.group, ordinal, q)];
+                                        if (peer.weight != 0) result += peer.weight * (x[i] - x[peer.left == i ? peer.right : peer.left]);
+                                    }
+                            }
+                        }
+                }
+        } else
+            for (int k = 0; k < 24; ++k) {
+                int f = level.adjacency[k * level.count + i];
+                if (f < 0) break;
+                Edge edge = level.edges[f];
+                result += edge.weight * (x[i] - x[edge.left == i ? edge.right : edge.left]);
+            }
+        return result;
     }
-
+    __global__ void rhs_kernel(Grid grid, Fields fields, PressureLevel fine, const unsigned char* anchors, double* solution, float* residual) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= fine.count) return;
+        float h     = spacing(grid.layout, i);
+        double flux = -double(grid.solidDivergence[i]) * h * h * h;
+        for (int a = 0; a < 3; ++a)
+            for (int sign = -1; sign <= 1; sign += 2)
+                for (int f : cell_faces(grid, i, a, sign).face)
+                    if (f >= 0) flux += sign * (double(grid.faces[f].area) * fields.velocity[f] + grid.faces[f].solidFlux);
+        fine.rhs[i] = residual[i] = grid.fluid[i] && !anchors[i] ? -flux / grid.layout.h : 0;
+        solution[i]               = 0;
+    }
+    void assemble_rhs(Grid grid, Fields fields, PressureWorkspace workspace, cudaStream_t stream) {
+        rhs_kernel<<<(workspace.levels[0].count + 255) / 256, 256, 0, stream>>>(grid, fields, workspace.levels[0], workspace.anchors, workspace.solution, workspace.residual);
+    }
+    __global__ void smooth(Grid grid, PressureLevel level, const float* rhs, const float* input, float* output, bool fine, bool second, float upper, const IterationState* state) {
+        if (state->converged || state->failed) return;
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= level.count) return;
+        // The flux-consistent interface adds signed peer couplings. Its
+        // normalized spectral upper bound is 3, not the M-matrix bound of 2.
+        float theta = .5f * (upper + .3f), delta = .5f * (upper - .3f);
+        float alpha    = 1.f / (theta - delta * delta / (2 * theta));
+        float beta     = alpha * delta * delta / (2 * theta);
+        float residual = level.diagonal[i] > 0 ? (rhs[i] - matrix_product(grid, level, input, i, fine)) / level.diagonal[i] : 0;
+        output[i]      = level.diagonal[i] > 0 ? input[i] + (second ? alpha : 1.f / theta) * residual + (second ? beta * (input[i] - output[i]) : 0) : 0;
+    }
+    __global__ void restrict_residual(Grid grid, PressureLevel fine, PressureLevel coarse, const float* rhs, bool finest, const IterationState* state) {
+        if (state->converged || state->failed) return;
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= coarse.count) return;
+        double value = 0;
+        for (int c = 0; c < 8; ++c) {
+            int j = coarse.children[i * 8 + c];
+            if (j >= 0) value += rhs[j] - matrix_product(grid, fine, fine.solution, j, finest);
+        }
+        coarse.rhs[i] = float(value);
+    }
     __global__ void prolongate(PressureLevel fine, PressureLevel coarse, const IterationState* state) {
         if (state->converged || state->failed) return;
-        int id = fine.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i  = id * blockCells + local;
-            int3 c = cell_coordinate(fine.layout, i);
-            if (fine.diagonal[i] > 0.0f) fine.solution[i] += value(coarse.solution, cell_index(coarse.layout, {c.x >> 1, c.y >> 1, c.z >> 1}));
-        }
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < fine.count) fine.solution[i] += coarse.solution[fine.parent[i]];
     }
-
     __global__ void solve_coarsest(PressureLevel level, const float* rhs, const IterationState* state) {
         if (state->converged || state->failed) return;
-        // A single CTA owns the entire coarse solve, including its global barriers.
-        // Symmetric relaxation remains a preconditioner; outer PCG checks the true residual.
-        for (int sweep = 0; sweep < 8; ++sweep)
-            for (int phase = 0; phase < 4; ++phase) {
-                int color = phase == 0 || phase == 3 ? 0 : 1;
-                for (int j = threadIdx.x; j < level.layout.blocks * blockCells; j += blockDim.x) {
-                    int local = j & 511;
-                    if (((local + (local >> 3) + (local >> 6)) & 1) != color) continue;
-                    int i          = level.layout.active[j >> 9] * blockCells + local;
-                    float diagonal = level.diagonal[i];
-                    if (diagonal > 0.0f) level.solution[i] += (rhs[i] - matrix_product(level, level.solution, i)) / diagonal;
+        __shared__ float x[256], next[256];
+        int i = threadIdx.x;
+        x[i]  = 0;
+        __syncthreads();
+        for (int iteration = 0; iteration < 96; ++iteration) {
+            if (i < level.count) {
+                float value = level.boundary[i] * x[i];
+                for (int k = 0; k < 24; ++k) {
+                    int f = level.adjacency[k * level.count + i];
+                    if (f < 0) break;
+                    Edge edge = level.edges[f];
+                    value += edge.weight * (x[i] - x[edge.left == i ? edge.right : edge.left]);
                 }
-                __syncthreads();
+                next[i] = level.diagonal[i] > 0 ? x[i] + (2.f / 3) * (rhs[i] - value) / level.diagonal[i] : 0;
             }
+            __syncthreads();
+            if (i < level.count) x[i] = next[i];
+            __syncthreads();
+        }
+        if (i < level.count) level.solution[i] = x[i];
     }
-
-    __global__ void dot_blocks(PressureLevel level, const float* a, const float* b, double* partial, const IterationState* state, bool maximum) {
+    void precondition(Grid grid, PressureWorkspace workspace, cudaStream_t stream) {
+        for (int l = 0; l < workspace.levelCount; ++l) {
+            auto level       = workspace.levels[l];
+            const float* rhs = l ? level.rhs : workspace.residual;
+            if (l + 1 == workspace.levelCount) solve_coarsest<<<1, 256, 0, stream>>>(level, rhs, workspace.iteration);
+            else {
+                cuda_check(cudaMemsetAsync(level.solution, 0, level.count * sizeof(float), stream));
+                smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.solution, level.temporary, l == 0, false, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
+                smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.temporary, level.solution, l == 0, true, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
+                auto coarse = workspace.levels[l + 1];
+                restrict_residual<<<(coarse.count + 255) / 256, 256, 0, stream>>>(grid, level, coarse, rhs, l == 0, workspace.iteration);
+            }
+        }
+        for (int l = workspace.levelCount - 2; l >= 0; --l) {
+            auto level       = workspace.levels[l];
+            const float* rhs = l ? level.rhs : workspace.residual;
+            prolongate<<<(level.count + 255) / 256, 256, 0, stream>>>(level, workspace.levels[l + 1], workspace.iteration);
+            smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.solution, level.temporary, l == 0, false, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
+            smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.temporary, level.solution, l == 0, true, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
+        }
+    }
+    __global__ void sum_closed_residual(int count, const float* residual, const int* components, const int* open, double* sums) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < count && !open[components[i]]) atomicAdd(sums + components[i], double(residual[i]));
+    }
+    void component_sums(Grid grid, PressureWorkspace workspace, cudaStream_t stream) {
+        if (!workspace.closed) return;
+        int count = grid.layout.count * 512;
+        cuda_check(cudaMemsetAsync(workspace.componentSums, 0, count * sizeof(double), stream));
+        sum_closed_residual<<<(count + 255) / 256, 256, 0, stream>>>(count, workspace.residual, workspace.components, workspace.open, workspace.componentSums);
+    }
+    __global__ void dot_blocks(Grid grid, const float* a, const float* b, double* partial, const IterationState* state, bool maximum, const double* componentSums = nullptr, const unsigned char* anchors = nullptr) {
         if (state->converged || state->failed) return;
-        __shared__ double sums[threads];
-        __shared__ float maxima[threads];
-        int id        = level.layout.active[blockIdx.x];
-        double sum    = 0.0;
-        float largest = 0.0f;
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            sum += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-            if (maximum) largest = fmaxf(largest, fabsf(a[i]));
+        __shared__ double sums[256];
+        __shared__ float maxima[256];
+        int i = blockIdx.x * blockDim.x + threadIdx.x, count = grid.layout.count * 512;
+        double sum    = i < count ? double(a[i]) * b[i] : 0;
+        float largest = 0;
+        if (i < count && maximum) {
+            float h = spacing(grid.layout, i);
+            largest = (anchors && anchors[i] ? float(fabs(componentSums[i])) : fabsf(a[i])) * grid.layout.h / (h * h * h);
         }
         sums[threadIdx.x]   = sum;
         maxima[threadIdx.x] = largest;
         __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        for (int stride = 128; stride; stride >>= 1) {
             if (threadIdx.x < stride) {
                 sums[threadIdx.x] += sums[threadIdx.x + stride];
                 maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
             }
             __syncthreads();
         }
-        if (threadIdx.x == 0) {
-            partial[blockIdx.x]                       = sums[0];
-            partial[level.layout.blocks + blockIdx.x] = maxima[0];
+        if (!threadIdx.x) {
+            partial[blockIdx.x]             = sums[0];
+            partial[gridDim.x + blockIdx.x] = maxima[0];
         }
     }
-
     __global__ void finish_dot(double* partial, int count, IterationState* state, int operation, float relativeTolerance, float absoluteTolerance) {
         if (state->converged || state->failed) return;
-        __shared__ double sums[threads], maxima[threads];
-        double sum = 0.0, largest = 0.0;
+        __shared__ double sums[256], maxima[256];
+        double sum = 0, largest = 0;
         for (int i = threadIdx.x; i < count; i += blockDim.x) {
             sum += partial[i];
             largest = fmax(largest, partial[count + i]);
@@ -284,7 +434,7 @@ namespace pyro::cuda {
         sums[threadIdx.x]   = sum;
         maxima[threadIdx.x] = largest;
         __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        for (int stride = 128; stride; stride >>= 1) {
             if (threadIdx.x < stride) {
                 sums[threadIdx.x] += sums[threadIdx.x + stride];
                 maxima[threadIdx.x] = fmax(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
@@ -301,193 +451,95 @@ namespace pyro::cuda {
             state->rz         = sums[0];
         } else if (operation == 1) {
             state->denominator = sums[0];
-            if (sums[0] <= 0.0) state->failed = 1;
+            if (sums[0] <= 0) state->failed = 1;
         } else {
             if (operation == 2) state->initialNorm = sums[0];
-            state->residualNorm = sums[0];
-            state->maxResidual  = static_cast<float>(maxima[0]);
-            bool relative       = sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance;
-            state->converged    = maxima[0] <= absoluteTolerance && (relative || maxima[0] <= absoluteTolerance * 0.1f);
+            state->maxResidual = float(maxima[0]);
+            state->converged   = maxima[0] <= absoluteTolerance && (sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance || maxima[0] <= absoluteTolerance * .1f);
         }
     }
-
-    __global__ void search_direction(PressureLevel level, float* direction, const IterationState* state, bool first) {
+    __global__ void direction_kernel(PressureLevel fine, float* direction, const IterationState* state, bool first) {
         if (state->converged || state->failed) return;
-        int id     = level.layout.active[blockIdx.x];
-        float beta = first ? 0.0f : static_cast<float>(state->rz / state->previousRz);
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i        = id * blockCells + local;
-            direction[i] = first ? level.solution[i] : level.solution[i] + beta * direction[i];
-        }
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < fine.count) direction[i] = fine.solution[i] + (first ? 0 : float(state->rz / state->previousRz) * direction[i]);
     }
-
-    __global__ void apply_matrix(PressureLevel level, const float* direction, float* product, double* partial, const IterationState* state) {
+    template <typename T>
+    __global__ void product_kernel(Grid grid, PressureLevel fine, const T* input, float* output, const IterationState* state, bool residual) {
+        if (!residual && (state->converged || state->failed)) return;
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < fine.count) output[i] = (residual ? fine.rhs[i] : 0) + (residual ? -1 : 1) * matrix_product(grid, fine, input, i, true);
+    }
+    __global__ void update_kernel(int count, double* solution, float* residual, const float* direction, const float* product, const IterationState* state) {
         if (state->converged || state->failed) return;
-        __shared__ double sums[threads];
-        double sum = 0.0;
-        int id     = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i        = id * blockCells + local;
-            float result = matrix_product(level, direction, i);
-            product[i]   = result;
-            sum += static_cast<double>(direction[i]) * static_cast<double>(result);
-        }
-        sums[threadIdx.x] = sum;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
-            if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
-            __syncthreads();
-        }
-        if (!threadIdx.x) {
-            partial[blockIdx.x]                       = sums[0];
-            partial[level.layout.blocks + blockIdx.x] = 0.0;
-        }
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= count) return;
+        float alpha = float(state->rz / state->denominator);
+        solution[i] += (state->rz / state->denominator) * double(direction[i]);
+        residual[i] -= alpha * product[i];
     }
-
-    __global__ void update_iterate(PressureLevel level, float* solution, float* residual, const float* direction, const float* product, double* partial, IterationState* state) {
-        if (state->converged || state->failed) return;
-        __shared__ double sums[threads];
-        __shared__ float maxima[threads];
-        double sum    = 0.0;
-        float largest = 0.0f;
-        int id        = level.layout.active[blockIdx.x];
-        float alpha   = static_cast<float>(state->rz / state->denominator);
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            solution[i] += alpha * direction[i];
-            float r     = residual[i] - alpha * product[i];
-            residual[i] = r;
-            sum += static_cast<double>(r) * static_cast<double>(r);
-            largest = fmaxf(largest, fabsf(r));
-        }
-        sums[threadIdx.x]   = sum;
-        maxima[threadIdx.x] = largest;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                sums[threadIdx.x] += sums[threadIdx.x + stride];
-                maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
-            }
-            __syncthreads();
-        }
-        if (!threadIdx.x) {
-            partial[blockIdx.x]                       = sums[0];
-            partial[level.layout.blocks + blockIdx.x] = maxima[0];
-        }
-        // Iteration count is advanced in a separate kernel to avoid a cross-CTA race.
-    }
-
     __global__ void count_iteration(IterationState* state) {
         if (!state->converged && !state->failed) ++state->iterations;
     }
-
-    __global__ void true_residual(PressureLevel level, const float* solution, float* residual) {
-        int id = level.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i       = id * blockCells + local;
-            residual[i] = level.rhs[i] - matrix_product(level, solution, i);
-        }
-    }
-
-    __global__ void project_velocity(Grid grid, Fields fields, const float* pressure, float h, float3 wind) {
-        int id = grid.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            if (!grid.fluid[i]) {
-                fields.smoke[i]       = 0.0f;
-                fields.temperature[i] = 0.0f;
-            }
-            for (int axis = 0; axis < 3; ++axis) {
-                int j      = neighbor(grid.layout, i, axis, -1);
-                bool right = grid.fluid[i], left = j >= 0 && grid.fluid[j];
-                if (grid.aperture[axis][i] <= 0.0f) fields.velocity[axis][i] = grid.solidVelocity[axis][i];
-                else if (right || left) {
-                    float difference = (right ? pressure[i] : 0.0f) - (left ? pressure[j] : 0.0f);
-                    fields.velocity[axis][i] -= difference * (left && right ? 1.0f : 2.0f) / h;
-                } else fields.velocity[axis][i] = component(wind, axis);
-            }
-        }
-    }
-
-    void precondition(PressureWorkspace workspace, cudaStream_t stream) {
-        for (int l = 0; l < workspace.levelCount; ++l) {
-            auto level       = workspace.levels[l];
-            const float* rhs = l == 0 ? workspace.residual : level.rhs;
-            zero_solution<<<level.layout.blocks, threads, 0, stream>>>(level, workspace.iteration);
-            if (l + 1 == workspace.levelCount) solve_coarsest<<<1, threads, 0, stream>>>(level, rhs, workspace.iteration);
-            else {
-                smooth<<<level.layout.blocks, threads, 0, stream>>>(level, rhs, 0, workspace.iteration);
-                smooth<<<level.layout.blocks, threads, 0, stream>>>(level, rhs, 1, workspace.iteration);
-                restrict_residual<<<workspace.levels[l + 1].layout.blocks, threads, 0, stream>>>(level, workspace.levels[l + 1], rhs, workspace.iteration);
-            }
-        }
-        for (int l = workspace.levelCount - 2; l >= 0; --l) {
-            auto level       = workspace.levels[l];
-            const float* rhs = l == 0 ? workspace.residual : level.rhs;
-            prolongate<<<level.layout.blocks, threads, 0, stream>>>(level, workspace.levels[l + 1], workspace.iteration);
-            smooth<<<level.layout.blocks, threads, 0, stream>>>(level, rhs, 1, workspace.iteration);
-            smooth<<<level.layout.blocks, threads, 0, stream>>>(level, rhs, 0, workspace.iteration);
-        }
-    }
-
-    void assemble_pressure(Grid grid, Fields fields, PressureWorkspace workspace, float h, bool obstacles, bool rebuild, cudaStream_t stream) {
+    void begin_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
         auto fine = workspace.levels[0];
-        int count = fine.layout.blocks;
-        if (rebuild) assemble_fine<true><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.openComponents, workspace.anchors, workspace.solution, workspace.residual);
-        else assemble_fine<false><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.openComponents, workspace.anchors, workspace.solution, workspace.residual);
-        if (obstacles && rebuild) {
-            connect_components<<<count, threads, 0, stream>>>(fine, grid.fluid, workspace.parents);
-            mark_components<<<count, threads, 0, stream>>>(fine, workspace.parents, workspace.openComponents);
-            anchor_components<<<count, threads, 0, stream>>>(fine, grid.fluid, workspace.parents, workspace.openComponents, workspace.anchors, workspace.residual);
-            anchor_faces<<<count, threads, 0, stream>>>(fine, workspace.anchors);
-        }
+        int count = (fine.count + 255) / 256;
+        component_sums(grid, workspace, stream);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        precondition(grid, workspace, stream);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
     }
-
-    void coarse_topology(Layout fine, Layout coarse, cudaStream_t stream) {
-        cuda_check(cudaMemsetAsync(coarse.keys, 255, coarse.tableCapacity * sizeof(unsigned long long), stream));
-        cuda_check(cudaMemsetAsync(coarse.count, 0, sizeof(int), stream));
-        coarse_keys<<<(fine.blocks + threads - 1) / threads, threads, 0, stream>>>(fine, coarse);
-        coarse_indices<<<(coarse.tableCapacity + threads - 1) / threads, threads, 0, stream>>>(coarse);
-    }
-
-    void coarse_matrix(PressureLevel fine, PressureLevel coarse, cudaStream_t stream) {
-        build_neighbors(coarse.layout, stream);
-        coarsen_matrix<<<coarse.layout.blocks, threads, 0, stream>>>(fine, coarse);
-    }
-
-    void begin_pressure(PressureWorkspace workspace, Config config, cudaStream_t stream) {
+    void iterate_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
         auto fine = workspace.levels[0];
-        int count = fine.layout.blocks;
-        dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
-        precondition(workspace, stream);
-        dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
-        search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
-    }
-
-    void iterate_pressure(PressureWorkspace workspace, Config config, cudaStream_t stream) {
-        auto fine = workspace.levels[0];
-        int count = fine.layout.blocks;
-        apply_matrix<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0.0f, 0.0f);
-        update_iterate<<<count, threads, 0, stream>>>(fine, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
+        int count = (fine.count + 255) / 256;
+        product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.direction, workspace.product, workspace.iteration, false);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, false);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0, 0);
+        update_kernel<<<count, 256, 0, stream>>>(fine.count, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.iteration);
         count_iteration<<<1, 1, 0, stream>>>(workspace.iteration);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
-        precondition(workspace, stream);
-        dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
-        search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
+        component_sums(grid, workspace, stream);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        precondition(grid, workspace, stream);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
     }
-
-    void check_pressure(PressureWorkspace workspace, Config config, cudaStream_t stream) {
+    void check_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
         auto fine = workspace.levels[0];
-        true_residual<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.solution, workspace.residual);
-        dot_blocks<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, fine.layout.blocks, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.5f);
+        int count = (fine.count + 255) / 256;
+        product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.solution, workspace.residual, workspace.iteration, true);
+        component_sums(grid, workspace, stream);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .5f);
     }
-
-    void apply_pressure(Grid grid, Fields fields, const float* pressure, float h, float3 wind, cudaStream_t stream) {
-        project_velocity<<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, pressure, h, wind);
+    __global__ void project_faces(Grid grid, Fields fields, const double* pressure) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= grid.layout.count * 1728) return;
+        Face face = grid.faces[f];
+        if (face.left < 0 && face.right < 0) return;
+        if (face.weight > 0) {
+            double difference = (face.left >= 0 ? pressure[face.left] : 0) - (face.right >= 0 ? pressure[face.right] : 0);
+            if (face.group >= 0) {
+                double average = 0, total = 0;
+                for (int peer : grid.links[face.group].face) {
+                    Face adjacent = grid.faces[peer];
+                    int fine      = spacing(grid.layout, adjacent.left) < spacing(grid.layout, adjacent.right) ? adjacent.left : adjacent.right;
+                    average += adjacent.weight * pressure[fine];
+                    total += adjacent.weight;
+                }
+                average /= total;
+                difference = spacing(grid.layout, face.left) < spacing(grid.layout, face.right) ? average - pressure[face.right] : pressure[face.left] - average;
+            }
+            fields.velocity[f] += float(difference / face.distance);
+        } else if (face.area <= 0) {
+            float h            = ldexpf(grid.layout.h, grid.layout.blocks[f / 1728].level);
+            fields.velocity[f] = face.solidFlux / (h * h);
+        }
     }
-} // namespace pyro::cuda
+    void apply_pressure(Grid grid, Fields fields, const double* pressure, cudaStream_t stream) {
+        project_faces<<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, fields, pressure);
+    }
+} // namespace pyro::cuda::sparse

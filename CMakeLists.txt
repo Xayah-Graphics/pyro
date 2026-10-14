@@ -29,8 +29,8 @@ include(cmake/cuda.cmake)
 # ============================================================================
 # Solver
 # ============================================================================
-add_library(pyro_geometry STATIC solver/geometry.cu)
-target_sources(pyro_geometry PUBLIC FILE_SET CXX_MODULES FILES solver/types.ixx)
+add_library(pyro_geometry STATIC solver/geometry.cpp solver/geometry.cu)
+target_sources(pyro_geometry PUBLIC FILE_SET CXX_MODULES FILES solver/types.ixx solver/geometry.ixx)
 target_link_libraries(pyro_geometry PUBLIC CUDA::cudart)
 foreach(backend IN ITEMS sparse dense)
     add_library(pyro_${backend} STATIC
@@ -42,6 +42,7 @@ foreach(backend IN ITEMS sparse dense)
     target_sources(pyro_${backend} PUBLIC FILE_SET CXX_MODULES FILES solver/${backend}/solver.ixx)
     target_link_libraries(pyro_${backend} PUBLIC pyro_geometry)
 endforeach()
+target_sources(pyro_sparse PRIVATE solver/sparse/transfer.cu)
 foreach(target IN ITEMS pyro_geometry pyro_sparse pyro_dense)
     target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>")
     target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>")

@@ -62,7 +62,7 @@ namespace pyro::cuda::dense {
         float* temporary{};
     };
     struct IterationState {
-        double rz{}, previousRz{}, denominator{}, initialNorm{}, residualNorm{};
+        double rz{}, previousRz{}, denominator{}, initialNorm{};
         float maxResidual{};
         int iterations{}, converged{}, failed{};
     };

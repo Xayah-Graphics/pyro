@@ -1,256 +1,263 @@
 #include "cuda.cuh"
 
-namespace pyro::cuda {
-    __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float endTime, float dt, const Collider* colliders, int count, bool& clipped) {
-        Layout layout = grid.layout;
-        clipped       = false;
-        if (count) {
-            float3 world   = p * h;
-            float distance = sample_boundary(grid, world, endTime, h);
-            if (distance < 0.01f * h) {
-                // A partially open face may have its MAC center inside the
-                // solid. Start its characteristic on the fluid side instead
-                // of freezing this sample at its own previous velocity.
-                float e = 0.25f * h;
-                float3 gradient{sample_boundary(grid, world + float3{e, 0, 0}, endTime, h) - sample_boundary(grid, world - float3{e, 0, 0}, endTime, h), sample_boundary(grid, world + float3{0, e, 0}, endTime, h) - sample_boundary(grid, world - float3{0, e, 0}, endTime, h), sample_boundary(grid, world + float3{0, 0, e}, endTime, h) - sample_boundary(grid, world - float3{0, 0, e}, endTime, h)};
-                p       = p + gradient * ((0.01f * h - distance) / (h * fmaxf(length(gradient), 1.0e-20f)));
-                clipped = true;
+namespace pyro::cuda::sparse {
+    template <bool obstacles>
+    __device__ float3 trace(Grid grid, Fields carrier, Config config, float3 p, float time, float dt, const Collider* colliders, int count, bool& clipped) {
+        clipped = false;
+        float h = config.cellSize;
+        if constexpr (obstacles) {
+            float distance = sample_boundary(grid, p, time);
+            if (distance < .01f * h) {
+                float3 gradient{};
+                float dx = sample_boundary(grid, p + float3{h * .25f, 0, 0}, time) - sample_boundary(grid, p - float3{h * .25f, 0, 0}, time);
+                float dy = sample_boundary(grid, p + float3{0, h * .25f, 0}, time) - sample_boundary(grid, p - float3{0, h * .25f, 0}, time);
+                float dz = sample_boundary(grid, p + float3{0, 0, h * .25f}, time) - sample_boundary(grid, p - float3{0, 0, h * .25f}, time);
+                gradient = {dx, dy, dz};
+                p        = p + gradient * ((.01f * h - distance) / fmaxf(length(gradient), 1.e-20f));
+                clipped  = true;
             }
         }
-        float3 first     = sample_velocity(layout, carrier, p, wind);
-        float3 middle    = sample_velocity(layout, carrier, p - first * (0.5f * dt / h), wind);
-        float3 departure = p - middle * (dt / h);
-        if (!count) return departure;
-        float motion = 0.0f;
-        for (int i = 0; i < count; ++i) motion = fmaxf(motion, (colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent)));
-        float bound = length(departure - p) * h + motion * fabsf(dt);
-        if (bound < 1.0e-12f) return departure;
-        float fraction = 0.0f;
-        // Conservative advancement through the swept space-time SDF.
+        float3 v = sample_velocity(grid, carrier, p, config.wind), middle = sample_velocity(grid, carrier, p - v * (.5f * dt), config.wind);
+        float3 departure = p - middle * dt;
+        if constexpr (!obstacles) return departure;
+        float motion = 0;
+        for (int i = 0; i < count; ++i) motion = fmaxf(motion, colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent));
+        float bound = length(departure - p) + motion * fabsf(dt), fraction = 0;
+        if (bound < 1.e-12f) return departure;
         for (int step = 0; step < 64; ++step) {
-            float3 position = p + (departure - p) * fraction;
-            float distance  = sample_boundary(grid, position * h, endTime - dt * fraction, h);
-            if (distance < 0.001f * h) {
+            float3 q = p + (departure - p) * fraction;
+            float d  = sample_boundary(grid, q, time - dt * fraction);
+            if (d < .001f * h) {
                 clipped = true;
-                return position;
+                return q;
             }
-            fraction += 0.5f * distance / bound;
-            if (fraction >= 1.0f) return departure;
+            fraction += .5f * d / bound;
+            if (fraction >= 1) return departure;
         }
         clipped = true;
         return p + (departure - p) * fraction;
     }
-
-    template <bool correct>
-    __global__ void transport_velocity(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float time, float dt) {
-        int id = grid.layout.active[blockIdx.x], axis = blockIdx.y;
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i         = id * blockCells + local;
-            float* output = destination.velocity[axis];
-            if (grid.aperture[axis][i] == 0.0f) {
-                output[i] = grid.solidVelocity[axis][i];
-                continue;
-            }
-            int3 c = cell_coordinate(grid.layout, i);
-            float3 stagger{0.5f, 0.5f, 0.5f};
-            if (axis == 0) stagger.x = 0.0f;
-            if (axis == 1) stagger.y = 0.0f;
-            if (axis == 2) stagger.z = 0.0f;
-            float3 p{c.x + stagger.x, c.y + stagger.y, c.z + stagger.z};
-            const float* input = original.velocity[axis];
-            float background   = component(config.wind, axis);
-            bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, colliders, count, clipped);
-            float lo, hi;
-            float transported = sample(grid.layout, input, departure - stagger, background, &lo, &hi);
-            if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, colliders, count, clipped);
-                if (!clipped) transported = fminf(hi, fmaxf(lo, transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], reverse - stagger, background))));
-            }
-            output[i] = transported;
+    template <bool correct, bool obstacles>
+    __global__ void transport_cells(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.count * 512) return;
+        if (!grid.fluid[i]) {
+            destination.smoke[i] = destination.temperature[i] = 0;
+            return;
+        }
+        float3 p = center(grid.layout, i);
+        bool clipped, reverseClipped = true;
+        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, colliders, count, clipped), reverse{};
+        if (correct && !clipped) reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, colliders, count, reverseClipped);
+        for (int field = 3; field < 5; ++field) {
+            float lo, hi, value = sample(grid, grid.state, departure, field, 0, &lo, &hi);
+            if (correct && !clipped && !reverseClipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field))));
+            (field == 3 ? destination.smoke : destination.temperature)[i] = value;
         }
     }
-
-    __device__ float2 sample_scalars(Layout layout, Fields fields, float3 position, float2* lower = nullptr, float2* upper = nullptr) {
-        int3 p{static_cast<int>(floorf(position.x)), static_cast<int>(floorf(position.y)), static_cast<int>(floorf(position.z))};
-        float3 t{position.x - p.x, position.y - p.y, position.z - p.z};
-        float2 result{}, lo{1.0e30f, 1.0e30f}, hi{-1.0e30f, -1.0e30f};
-        for (int z = 0; z < 2; ++z)
-            for (int y = 0; y < 2; ++y)
-                for (int x = 0; x < 2; ++x) {
-                    int i       = cell_index(layout, {p.x + x, p.y + y, p.z + z});
-                    float smoke = value(fields.smoke, i), heat = value(fields.temperature, i);
-                    result.x += smoke * (x ? t.x : 1.0f - t.x) * (y ? t.y : 1.0f - t.y) * (z ? t.z : 1.0f - t.z);
-                    result.y += heat * (x ? t.x : 1.0f - t.x) * (y ? t.y : 1.0f - t.y) * (z ? t.z : 1.0f - t.z);
-                    lo.x = fminf(lo.x, smoke);
-                    lo.y = fminf(lo.y, heat);
-                    hi.x = fmaxf(hi.x, smoke);
-                    hi.y = fmaxf(hi.y, heat);
-                }
-        if (lower) *lower = lo;
-        if (upper) *upper = hi;
-        return result;
+    template <bool correct, bool obstacles>
+    __global__ void transport_faces(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= grid.layout.count * 1728) return;
+        Face face = grid.faces[f];
+        if (face.left < 0 && face.right < 0) {
+            destination.velocity[f] = 0;
+            return;
+        }
+        float3 p;
+        float h;
+        int axis, owner, sign;
+        face_position(grid.layout, f, p, h, axis, owner, sign);
+        if (face.area <= 0) {
+            destination.velocity[f] = face.solidFlux / (h * h);
+            return;
+        }
+        bool clipped;
+        float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, colliders, count, clipped);
+        float lo, hi, value = sample(grid, grid.state, departure, axis, component(config.wind, axis), &lo, &hi);
+        if (correct && !clipped) {
+            float3 reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, colliders, count, clipped);
+            if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, component(config.wind, axis)))));
+        }
+        destination.velocity[f] = value;
     }
-
-    template <bool correct>
-    __global__ void transport_scalars(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float time, float dt) {
-        int id = grid.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i = id * blockCells + local;
-            if (!grid.fluid[i]) {
-                destination.smoke[i]       = 0.0f;
-                destination.temperature[i] = 0.0f;
-                continue;
-            }
-            int3 c = cell_coordinate(grid.layout, i);
-            float3 stagger{0.5f, 0.5f, 0.5f}, p{c.x + 0.5f, c.y + 0.5f, c.z + 0.5f};
-            bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, colliders, count, clipped);
-            float2 lo, hi;
-            float2 transported = sample_scalars(grid.layout, original, departure - stagger, &lo, &hi);
-            if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, colliders, count, clipped);
-                if (!clipped) {
-                    float2 backward = sample_scalars(grid.layout, grid.transported, reverse - stagger);
-                    transported.x   = fminf(hi.x, fmaxf(lo.x, transported.x + 0.5f * (original.smoke[i] - backward.x)));
-                    transported.y   = fminf(hi.y, fmaxf(lo.y, transported.y + 0.5f * (original.temperature[i] - backward.y)));
+    __global__ void cache_samples(Grid grid, Fields fields, float3 wind, float* output) {
+        int block = blockIdx.x, field = blockIdx.y;
+        Block node = grid.layout.blocks[block];
+        int level  = node.level;
+        float h    = ldexpf(grid.layout.h, level);
+        float3 stagger{.5f, .5f, .5f};
+        if (field < 3) stagger = stagger - axis_vector(field, .5f);
+        float background = field < 3 ? component(wind, field) : 0;
+        for (int local = threadIdx.x; local < 1331; local += blockDim.x) {
+            int3 c{node.coordinate.x * 8 + local % 11 - 1, node.coordinate.y * 8 + (local / 11) % 11 - 1, node.coordinate.z * 8 + local / 121 - 1};
+            int b        = (c.x >> 3) == node.coordinate.x && (c.y >> 3) == node.coordinate.y && (c.z >> 3) == node.coordinate.z ? block : find_block(grid.layout, {c.x >> 3, c.y >> 3, c.z >> 3}, level);
+            float value  = background;
+            bool uniform = b >= 0;
+            float3 point{(c.x + stagger.x) * h, (c.y + stagger.y) * h, (c.z + stagger.z) * h};
+            if (b >= 0) {
+                int i = b * 512 + (c.x & 7) + 8 * (c.y & 7) + 64 * (c.z & 7);
+                if (field >= 3) value = (field == 3 ? fields.smoke : fields.temperature)[i];
+                else {
+                    int f      = negative_face(i, field);
+                    bool owned = grid.faces[f].left >= 0 || grid.faces[f].right >= 0;
+                    uniform &= owned && grid.faces[f].group < 0;
+                    value = owned ? fields.velocity[f] : side_velocity(grid, fields, i, field, -1);
                 }
+            } else if (field >= 3) {
+                int i = locate(grid.layout, point);
+                if (i >= 0) {
+                    const float* values = field == 3 ? fields.smoke : fields.temperature;
+                    if (grid.layout.blocks[i >> 9].level > level) value = values[i] + dot(scalar_gradient(grid, values, i), point - center(grid.layout, i));
+                    else {
+                        value = 0;
+                        for (int child = 0; child < 8; ++child) {
+                            float3 sub = point + float3{(child & 1 ? .25f : -.25f) * h, (child & 2 ? .25f : -.25f) * h, (child & 4 ? .25f : -.25f) * h};
+                            int j      = locate(grid.layout, sub);
+                            if (j >= 0) value += values[j] * .125f;
+                        }
+                    }
+                }
+            } else {
+                int i = locate(grid.layout, point + axis_vector(field, grid.layout.h * .001f));
+                if (i >= 0 && grid.layout.blocks[i >> 9].level < level) {
+                    value = 0;
+                    for (int child = 0; child < 4; ++child) value += .25f * face_value(grid, fields, point + axis_vector((field + 1) % 3, (child & 1 ? .25f : -.25f) * h) + axis_vector((field + 2) % 3, (child & 2 ? .25f : -.25f) * h), field, background);
+                } else value = face_value(grid, fields, point, field, background);
             }
-            destination.smoke[i]       = transported.x;
-            destination.temperature[i] = transported.y;
+            int index                  = (block * 5 + field) * 1331 + local;
+            output[index]              = value;
+            grid.uniformSamples[index] = uniform;
         }
     }
+    void advect(Grid grid, Fields destination, Fields carrier, Config config, const Collider* colliders, int count, float time, float dt, cudaStream_t stream) {
+        grid.state.samples       = grid.samples[0];
+        grid.transported.samples = grid.samples[2];
+        cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.state, config.wind, grid.samples[0]);
+        if (carrier.velocity == grid.state.velocity) carrier.samples = grid.samples[0];
+        else {
+            carrier.samples = grid.samples[1];
+            cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, carrier, config.wind, grid.samples[1]);
+        }
 
-    __global__ void forces_kernel(Grid grid, Config config, Fields destination, Fields forceFields, const Source* sources, int count, float time, float dt) {
-        int id = grid.layout.active[blockIdx.x];
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i  = id * blockCells + local;
-            int3 c = cell_coordinate(grid.layout, i);
-            float3 p{(c.x + 0.5f) * config.cellSize, (c.y + 0.5f) * config.cellSize, (c.z + 0.5f) * config.cellSize};
-            // Split decay symmetrically around source injection.
-            float smokeDecay = expf(-0.5f * config.dissipation * dt);
-            float heatDecay  = expf(-0.5f * config.cooling * dt);
-            float smoke = destination.smoke[i] * smokeDecay, heat = destination.temperature[i] * heatDecay;
-            for (int s = 0; s < count; ++s) {
-                Source source = sources[s];
-                float overlap = fmaxf(0.0f, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
-                float weight  = source_weight(source, p, config.cellSize, time + dt * 0.5f) * overlap;
-                smoke += source.smokeRate * weight;
-                heat += source.temperatureRate * weight;
-            }
-            destination.smoke[i]       = grid.fluid[i] ? smoke * smokeDecay : 0.0f;
-            destination.temperature[i] = grid.fluid[i] ? heat * heatDecay : 0.0f;
-            for (int axis = 0; axis < 3; ++axis) {
-                int previous      = neighbor(grid.layout, i, axis, -1);
-                float density     = 0.5f * (forceFields.smoke[i] + value(forceFields.smoke, previous));
-                float temperature = 0.5f * (forceFields.temperature[i] + value(forceFields.temperature, previous));
-                float velocity    = destination.velocity[axis][i] + component(config.up, axis) * (config.buoyancy * temperature - config.smokeWeight * density) * dt;
-                float3 face       = p;
-                if (axis == 0) face.x -= config.cellSize * 0.5f;
-                if (axis == 1) face.y -= config.cellSize * 0.5f;
-                if (axis == 2) face.z -= config.cellSize * 0.5f;
-                for (int s = 0; s < count; ++s) {
-                    Source source = sources[s];
-                    float overlap = fmaxf(0.0f, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
-                    float3 motionVelocity{};
-                    float blend = -expm1f(-source.velocityRate * source_weight(source, face, config.cellSize, time + dt * 0.5f, &motionVelocity) * overlap);
-                    velocity += blend * (component(source.velocity + motionVelocity * source.inheritVelocity, axis) - velocity);
-                }
-                destination.velocity[axis][i] = velocity;
-            }
+        if (count) {
+            transport_cells<false, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+            transport_faces<false, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+            cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.transported, config.wind, grid.samples[2]);
+            transport_cells<true, true><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
+            transport_faces<true, true><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
+        } else {
+            transport_cells<false, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+            transport_faces<false, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, grid.transported, carrier, config, colliders, count, time, dt);
+            cache_samples<<<dim3(grid.layout.count, 5), 256, 0, stream>>>(grid, grid.transported, config.wind, grid.samples[2]);
+            transport_cells<true, false><<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
+            transport_faces<true, false><<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, colliders, count, time, dt);
         }
     }
-
+    __global__ void scalar_forces(Grid grid, Fields destination, Config config, const Source* sources, int count, float time, float dt) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.count * 512) return;
+        float smoke = destination.smoke[i] * expf(-.5f * config.dissipation * dt), temperature = destination.temperature[i] * expf(-.5f * config.cooling * dt);
+        for (int s = 0; s < count; ++s) {
+            Source source    = sources[s];
+            source.mesh.band = .5f * spacing(grid.layout, i);
+            float active     = fmaxf(0, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
+            if (!active) continue;
+            float weight = source_weight(source, center(grid.layout, i), spacing(grid.layout, i), time + dt * .5f);
+            smoke += source.smokeRate * weight * active;
+            temperature += source.temperatureRate * weight * active;
+        }
+        destination.smoke[i]       = grid.fluid[i] ? smoke * expf(-.5f * config.dissipation * dt) : 0;
+        destination.temperature[i] = grid.fluid[i] ? temperature * expf(-.5f * config.cooling * dt) : 0;
+    }
+    __global__ void velocity_forces(Grid grid, Fields destination, Fields carrier, Config config, const Source* sources, int count, float time, float dt) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x;
+        if (f >= grid.layout.count * 1728 || grid.faces[f].area <= 0) return;
+        Face face = grid.faces[f];
+        float3 p;
+        float h;
+        int axis, owner, sign;
+        face_position(grid.layout, f, p, h, axis, owner, sign);
+        float smoke       = .5f * ((face.left >= 0 ? carrier.smoke[face.left] : 0) + (face.right >= 0 ? carrier.smoke[face.right] : 0));
+        float temperature = .5f * ((face.left >= 0 ? carrier.temperature[face.left] : 0) + (face.right >= 0 ? carrier.temperature[face.right] : 0));
+        float v           = destination.velocity[f] + component(config.up, axis) * (config.buoyancy * temperature - config.smokeWeight * smoke) * dt;
+        for (int s = 0; s < count; ++s) {
+            Source source    = sources[s];
+            source.mesh.band = .5f * h;
+            float active     = fmaxf(0, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
+            if (!active) continue;
+            float3 motion{};
+            float weight = source_weight(source, p, h, time + dt * .5f, &motion);
+            v += (component(source.velocity + motion * source.inheritVelocity, axis) - v) * (1 - expf(-source.velocityRate * weight * active));
+        }
+        destination.velocity[f] = v;
+    }
+    void forces(Grid grid, Fields destination, Fields carrier, Config config, const Source* sources, int count, float time, float dt, cudaStream_t stream) {
+        scalar_forces<<<grid.layout.count * 2, 256, 0, stream>>>(grid, destination, config, sources, count, time, dt);
+        velocity_forces<<<(grid.layout.count * 1728 + 255) / 256, 256, 0, stream>>>(grid, destination, carrier, config, sources, count, time, dt);
+    }
     template <bool full>
-    __global__ void statistics_kernel(Grid grid, Fields fields, Config config, double* partial) {
-        __shared__ double sums[6][threads];
-        double values[6]{};
-        int id       = grid.layout.active[blockIdx.x];
-        float volume = config.cellSize * config.cellSize * config.cellSize;
-        for (int local = threadIdx.x; local < blockCells; local += blockDim.x) {
-            int i       = id * blockCells + local;
-            float speed = length({fields.velocity[0][i], fields.velocity[1][i], fields.velocity[2][i]});
-            values[2]   = fmax(values[2], static_cast<double>(isfinite(speed) ? speed : INFINITY));
+    __global__ void measure_blocks(Grid grid, Config config, double* results) {
+        constexpr int count = full ? 6 : 2;
+        __shared__ double sums[count][256];
+        int b        = blockIdx.x;
+        double fluid = 0, divergence = 0, speed = 0, smoke = 0, heat = 0, acceleration = 0;
+        for (int local = threadIdx.x; local < 512; local += blockDim.x) {
+            int i = b * 512 + local;
             if (!grid.fluid[i]) continue;
+            float div = -grid.solidDivergence[i], velocitySquared = 0;
             if constexpr (full) {
-                float divergence = 0.0f;
-                for (int axis = 0; axis < 3; ++axis) {
-                    int right = neighbor(grid.layout, i, axis, 1);
-                    float a = grid.aperture[axis][i], b = value(grid.aperture[axis], right, 1.0f);
-                    divergence += b * value(fields.velocity[axis], right, component(config.wind, axis)) + (1.0f - b) * value(grid.solidVelocity[axis], right) - a * fields.velocity[axis][i] - (1.0f - a) * grid.solidVelocity[axis][i];
-                }
-                divergence = divergence / config.cellSize - grid.solidDivergence[i];
-                values[0] += 1.0;
-                values[1] = fmax(values[1], static_cast<double>(isfinite(divergence) ? fabsf(divergence) : INFINITY));
-                values[3] += fields.smoke[i] * volume;
-                values[4] += fields.temperature[i] * volume;
+                double h = spacing(grid.layout, i), volume = h * h * h;
+                ++fluid;
+                smoke += grid.state.smoke[i] * volume;
+                heat += grid.state.temperature[i] * volume;
             }
-            values[5] = fmax(values[5], static_cast<double>(fabsf(config.buoyancy * fields.temperature[i] - config.smokeWeight * fields.smoke[i]) * length(config.up)));
+            for (int a = 0; a < 3; ++a) {
+                if constexpr (full) div += (side_velocity(grid, grid.state, i, a, 1, true) - side_velocity(grid, grid.state, i, a, -1, true)) / spacing(grid.layout, i);
+                float v = fmaxf(fabsf(side_velocity(grid, grid.state, i, a, -1)), fabsf(side_velocity(grid, grid.state, i, a, 1)));
+                velocitySquared += v * v;
+            }
+            if constexpr (full) divergence = fmax(divergence, double(fabsf(div)));
+            speed        = fmax(speed, double(sqrtf(velocitySquared)));
+            acceleration = fmax(acceleration, double(fabsf(config.buoyancy * grid.state.temperature[i] - config.smokeWeight * grid.state.smoke[i])));
         }
-        for (int k = 0; k < 6; ++k) sums[k][threadIdx.x] = values[k];
+        if constexpr (full) {
+            double values[6]{fluid, divergence, speed, smoke, heat, acceleration};
+            for (int k = 0; k < count; ++k) sums[k][threadIdx.x] = values[k];
+        } else {
+            sums[0][threadIdx.x] = speed;
+            sums[1][threadIdx.x] = acceleration;
+        }
         __syncthreads();
-        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
+        for (int stride = 128; stride; stride >>= 1) {
             if (threadIdx.x < stride)
-                for (int k = 0; k < 6; ++k) {
-                    if (k == 1 || k == 2 || k == 5) sums[k][threadIdx.x] = fmax(sums[k][threadIdx.x], sums[k][threadIdx.x + stride]);
-                    else sums[k][threadIdx.x] += sums[k][threadIdx.x + stride];
-                }
+                for (int k = 0; k < count; ++k) sums[k][threadIdx.x] = full && (k == 0 || k == 3 || k == 4) ? sums[k][threadIdx.x] + sums[k][threadIdx.x + stride] : fmax(sums[k][threadIdx.x], sums[k][threadIdx.x + stride]);
             __syncthreads();
         }
         if (!threadIdx.x)
-            for (int k = 0; k < 6; ++k) partial[6 * blockIdx.x + k] = sums[k][0];
+            for (int k = 0; k < count; ++k) results[b * count + k] = sums[k][0];
     }
-
-    __global__ void finish_statistics(int count, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* partial, float* maximum) {
-        __shared__ double sums[6][threads];
-        double values[6]{};
-        for (int i = threadIdx.x; i < count; i += blockDim.x)
-            for (int k = 0; k < 6; ++k) {
-                if (k == 1 || k == 2 || k == 5) values[k] = fmax(values[k], partial[6 * i + k]);
-                else values[k] += partial[6 * i + k];
-            }
-        for (int k = 0; k < 6; ++k) sums[k][threadIdx.x] = values[k];
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride; stride >>= 1) {
-            if (threadIdx.x < stride)
-                for (int k = 0; k < 6; ++k) {
-                    if (k == 1 || k == 2 || k == 5) sums[k][threadIdx.x] = fmax(sums[k][threadIdx.x], sums[k][threadIdx.x + stride]);
-                    else sums[k][threadIdx.x] += sums[k][threadIdx.x + stride];
-                }
-            __syncthreads();
+    template <bool full>
+    __global__ void finish_measure(Grid grid, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* results) {
+        constexpr int count = full ? 6 : 2;
+        int k               = threadIdx.x;
+        if (k >= count) return;
+        double value = 0;
+        for (int b = 0; b < grid.layout.count; ++b) value = full && (k == 0 || k == 3 || k == 4) ? value + results[b * count + k] : fmax(value, results[b * count + k]);
+        if (k == (full ? 2 : 0)) {
+            for (int s = 0; s < sourceCount; ++s)
+                if (time >= sources[s].startTime && time <= sources[s].endTime) value = fmax(value, double(length(sources[s].velocity) + sources[s].motion.maxSpeed * sources[s].inheritVelocity));
+            for (int c = 0; c < colliderCount; ++c) value = fmax(value, double(colliders[c].shape == Shape::mesh ? colliders[c].motion.maxSpeed : length(colliders[c].linearVelocity) + length(colliders[c].angularVelocity) * length(colliders[c].halfExtent)));
         }
-        if (threadIdx.x) return;
-        for (int k = 0; k < 6; ++k) values[k] = sums[k][0];
-        for (int k = 0; k < 6; ++k) partial[config.maxBlocks * 6ull + k] = values[k];
-        float speed = fmaxf(static_cast<float>(values[2]), length(config.wind)), acceleration = static_cast<float>(values[5]);
-        for (int i = 0; i < sourceCount; ++i) {
-            Source source = sources[i];
-            if (time >= source.endTime || time + config.maxTimeStep < source.startTime) continue;
-            speed = fmaxf(speed, length(source.velocity) + source.motion.maxSpeed * fmaxf(1.0f, source.inheritVelocity));
-            acceleration += (fabsf(config.buoyancy * source.temperatureRate) + fabsf(config.smokeWeight * source.smokeRate)) * config.maxTimeStep * length(config.up);
+        results[grid.layout.count * count + k] = value;
+    }
+    void measure(Grid grid, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, bool full, double* reductions, cudaStream_t stream) {
+        if (full) {
+            if (grid.layout.count) measure_blocks<true><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
+            finish_measure<true><<<1, 32, 0, stream>>>(grid, sources, sourceCount, colliders, colliderCount, time, reductions);
+        } else {
+            if (grid.layout.count) measure_blocks<false><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
+            finish_measure<false><<<1, 32, 0, stream>>>(grid, sources, sourceCount, colliders, colliderCount, time, reductions);
         }
-        for (int i = 0; i < colliderCount; ++i) speed = fmaxf(speed, (colliders[i].shape == Shape::mesh ? colliders[i].motion.maxSpeed : length(colliders[i].linearVelocity) + length(colliders[i].angularVelocity) * length(colliders[i].halfExtent)));
-        maximum[0] = speed;
-        maximum[1] = acceleration;
     }
-
-    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, const Collider* colliders, int count, float startTime, float dt, cudaStream_t stream) {
-        dim3 velocityBlocks(grid.layout.blocks, 3);
-        transport_velocity<false><<<velocityBlocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, colliders, count, startTime, dt);
-        transport_scalars<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, colliders, count, startTime, dt);
-        transport_velocity<true><<<velocityBlocks, threads, 0, stream>>>(grid, config, destination, original, carrier, colliders, count, startTime, dt);
-        transport_scalars<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, colliders, count, startTime, dt);
-    }
-
-    void apply_sources_forces(Grid grid, Config config, Fields destination, Fields forceFields, const Source* sources, int count, float time, float dt, cudaStream_t stream) {
-        forces_kernel<<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, forceFields, sources, count, time, dt);
-    }
-
-    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {
-        if (grid.layout.blocks) {
-            if (full) statistics_kernel<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
-            else statistics_kernel<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
-        }
-        finish_statistics<<<1, threads, 0, stream>>>(grid.layout.blocks, config, sources, sourceCount, colliders, colliderCount, time, reductions, maximum);
-    }
-} // namespace pyro::cuda
+} // namespace pyro::cuda::sparse

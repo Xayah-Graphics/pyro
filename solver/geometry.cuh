@@ -132,8 +132,8 @@ namespace pyro::cuda {
         float3 v = ap - ab * (vb / (va + vb + vc)) - ac * (vc / (va + vb + vc));
         return dot(v, v);
     }
-    __device__ inline float mesh_distance(Mesh mesh, Motion motion, float3 world, float time, float3* velocity = nullptr, float offset = 0, float* divergence = nullptr) {
-        float band = mesh.band + fabsf(offset);
+    __device__ inline float mesh_distance(Mesh mesh, Motion motion, float3 world, float time, float3* velocity = nullptr, float offset = 0, float* divergence = nullptr, float queryBand = 0) {
+        float band = (queryBand > 0 ? queryBand : mesh.band) + fabsf(offset);
         if (velocity) *velocity = {};
         if (divergence) *divergence = 0;
         if (world.x < motion.swept.lower.x - band || world.y < motion.swept.lower.y - band || world.z < motion.swept.lower.z - band || world.x > motion.swept.upper.x + band || world.y > motion.swept.upper.y + band || world.z > motion.swept.upper.z + band) return band - offset;
@@ -223,7 +223,7 @@ namespace pyro::cuda {
         float3 v{q.x, q.y, q.z};
         return p + cross(v, cross(v, p) + p * q.w) * 2.0f;
     }
-    __device__ inline float solid_distance(float3 world, float time, const Collider* bodies, int count, float3* velocity = nullptr, float* divergence = nullptr) {
+    __device__ inline float solid_distance(float3 world, float time, const Collider* bodies, int count, float3* velocity = nullptr, float* divergence = nullptr, float queryBand = 0) {
         float distance = 1.0e20f;
         float3 speed{};
         float rate = 0;
@@ -239,7 +239,7 @@ namespace pyro::cuda {
             else if (body.shape == Shape::box) {
                 float3 e{fabsf(local.x) - body.halfExtent.x, fabsf(local.y) - body.halfExtent.y, fabsf(local.z) - body.halfExtent.z};
                 d = length({fmaxf(e.x, 0.0f), fmaxf(e.y, 0.0f), fmaxf(e.z, 0.0f)}) + fminf(fmaxf(e.x, fmaxf(e.y, e.z)), 0.0f);
-            } else d = mesh_distance(body.mesh, body.motion, world, time, &meshVelocity, body.surfaceOffset, &meshDivergence);
+            } else d = mesh_distance(body.mesh, body.motion, world, time, &meshVelocity, body.surfaceOffset, &meshDivergence, queryBand);
             if (d < distance) {
                 distance = d;
                 rate     = meshDivergence;

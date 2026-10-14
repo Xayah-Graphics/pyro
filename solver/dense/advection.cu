@@ -192,7 +192,7 @@ namespace pyro::cuda::dense {
         }
     }
 
-    __global__ void decay_kernel(Grid grid, Config config, Fields destination, float dt) {
+    __global__ void decay_kernel(Config config, Fields destination, float dt) {
         float smokeDecay = expf(-0.5f * config.dissipation * dt);
         float heatDecay  = expf(-0.5f * config.cooling * dt);
         for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
@@ -297,7 +297,7 @@ namespace pyro::cuda::dense {
             if (region.cached) source_kernel<true><<<(cells + threads - 1) / threads, threads, 0, stream>>>(grid, config, destination, sources, source, region, time, dt);
             else source_kernel<false><<<(cells + threads - 1) / threads, threads, 0, stream>>>(grid, config, destination, sources, source, region, time, dt);
         }
-        decay_kernel<<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, dt);
+        decay_kernel<<<grid.layout.blocks, threads, 0, stream>>>(config, destination, dt);
     }
 
     void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {

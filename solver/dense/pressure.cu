@@ -334,10 +334,9 @@ namespace pyro::cuda::dense {
             if (sums[0] <= 0.0) state->failed = 1;
         } else {
             if (operation == 2) state->initialNorm = sums[0];
-            state->residualNorm = sums[0];
-            state->maxResidual  = static_cast<float>(maxima[0]);
-            bool relative       = sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance;
-            state->converged    = maxima[0] <= absoluteTolerance && (relative || maxima[0] <= absoluteTolerance * 0.1f);
+            state->maxResidual = static_cast<float>(maxima[0]);
+            bool relative      = sums[0] <= state->initialNorm * relativeTolerance * relativeTolerance;
+            state->converged   = maxima[0] <= absoluteTolerance && (relative || maxima[0] <= absoluteTolerance * 0.1f);
         }
     }
 

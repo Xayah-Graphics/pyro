@@ -1,156 +1,45 @@
 module;
 #include "cuda.cuh"
-
 module pyro.sparse;
 import std;
+import pyro.geometry;
 
 namespace pyro::sparse {
-    // Host arrays and native CUDA vectors preserve the binary transfer layout.
-    static_assert(sizeof(std::array<float, 3>) == sizeof(float3) && alignof(std::array<float, 3>) == alignof(float3));
-    static_assert(sizeof(std::array<int, 3>) == sizeof(int3) && alignof(std::array<int, 3>) == alignof(int3));
-    static_assert(sizeof(Config) == sizeof(cuda::Config) && alignof(Config) == alignof(cuda::Config));
-    static_assert(sizeof(Motion) == sizeof(cuda::Motion) && alignof(Motion) == alignof(cuda::Motion));
-    static_assert(sizeof(Triangle) == sizeof(cuda::Triangle) && alignof(Triangle) == alignof(cuda::Triangle));
-    static_assert(sizeof(DensityBlock) == sizeof(cuda::DensityBlock) && alignof(DensityBlock) == alignof(cuda::DensityBlock));
-    static_assert(sizeof(GridBlock) == sizeof(cuda::GridBlock) && alignof(GridBlock) == alignof(cuda::GridBlock));
+    static_assert(sizeof(Config) == sizeof(cuda::sparse::Config));
+    static_assert(sizeof(GridBlock) == sizeof(cuda::sparse::Block));
+    static_assert(sizeof(DensityBlock) == sizeof(cuda::sparse::DensityBlock));
 
-    static void cuda_check(cudaError_t result) {
-        if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
-    }
-
-    Solver::Solver(const Config& settings) : config(settings), parameters(std::bit_cast<cuda::Config>(settings)) {
+    Solver::Solver(const Config& settings) : config(settings), parameters(std::bit_cast<cuda::sparse::Config>(settings)) {
         cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         cudaMemPool_t pool;
         cuda_check(cudaDeviceGetDefaultMemPool(&pool, 0));
         unsigned long long threshold = ~0ull;
         cuda_check(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold));
         try {
-            allocate_layout(grid.layout, config.maxBlocks);
-            auto cells = static_cast<unsigned long long>(config.maxBlocks) * cuda::blockCells;
-            allocate(grid.nextKeys, grid.layout.tableCapacity);
-            allocate(grid.nextIndices, grid.layout.tableCapacity);
-            allocate(grid.requested, grid.layout.tableCapacity);
-            allocate(grid.roles, config.maxBlocks);
-            allocate(grid.freeBlocks, config.maxBlocks);
-            allocate(grid.freeCount, 1);
-            allocate(grid.age, config.maxBlocks);
-            allocate(grid.fluid, cells);
-            allocate(grid.boundaryDirty, config.maxBlocks);
-            allocate(grid.solidDivergence, cells);
-            for (auto& phi : grid.distance) allocate(phi, cells);
-            for (auto& a : grid.aperture) allocate(a, cells);
-            for (auto& u : grid.solidVelocity) allocate(u, cells);
-            cuda::Fields* fields[]{&grid.state, &grid.midpoint, &grid.next, &grid.transported};
-            for (auto field : fields) {
-                for (auto& u : field->velocity) allocate(u, cells);
-                allocate(field->smoke, cells);
-                allocate(field->temperature, cells);
-            }
-            pressure.levels      = new cuda::PressureLevel[config.maxPressureLevels]{};
-            auto& fine           = pressure.levels[0];
-            fine.storageCapacity = config.maxBlocks;
-            allocate(fine.diagonal, cells);
-            allocate(fine.boundary, cells);
-            for (auto& a : fine.face) allocate(a, cells);
-            allocate(fine.solution, cells);
-            allocate(fine.rhs, cells);
-            allocate(fine.temporary, cells);
-            allocate(pressure.direction, cells);
-            allocate(pressure.product, cells);
-            allocate(pressure.solution, cells);
-            allocate(pressure.residual, cells);
-            allocate(pressure.parents, cells);
-            allocate(pressure.openComponents, cells);
-            allocate(pressure.anchors, cells);
-            allocate(pressure.reductions, config.maxBlocks * 6ull + 6);
+            pressure.levels = new cuda::sparse::PressureLevel[32]{};
+            allocate(topology.counters, 3);
             allocate(pressure.iteration, 1);
-            allocate(error, 1);
-            allocate(maximum, 2);
-            cuda_check(cudaStreamSynchronize(stream));
+            reserve(config.initialBlocks);
         } catch (...) {
-            this->~Solver();
+            release_storage();
             throw;
         }
     }
-
     Solver::~Solver() {
-        // cudaFreeAsync is ordered after outstanding work; teardown must not throw.
-        auto free = [stream = stream](void* pointer) {
-            if (pointer) cudaFreeAsync(pointer, stream);
-        };
-        free(grid.layout.keys);
-        free(grid.layout.indices);
-        free(grid.layout.coordinates);
-        free(grid.layout.active);
-        free(grid.layout.neighbors);
-        free(grid.layout.count);
-        free(grid.nextKeys);
-        free(grid.nextIndices);
-        free(grid.requested);
-        free(grid.roles);
-        free(grid.freeBlocks);
-        free(grid.freeCount);
-        free(grid.age);
-        free(grid.fluid);
-        free(grid.boundaryDirty);
-        free(grid.solidDivergence);
-        for (auto phi : grid.distance) free(phi);
-        for (auto a : grid.aperture) free(a);
-        for (auto u : grid.solidVelocity) free(u);
-        cuda::Fields fields[]{grid.state, grid.midpoint, grid.next, grid.transported};
-        for (auto field : fields) {
-            for (auto u : field.velocity) free(u);
-            free(field.smoke);
-            free(field.temperature);
-        }
-        if (pressure.levels)
-            for (int l = 0; l < config.maxPressureLevels; ++l) {
-                auto level = pressure.levels[l];
-                if (l) {
-                    free(level.layout.keys);
-                    free(level.layout.indices);
-                    free(level.layout.coordinates);
-                    free(level.layout.active);
-                    free(level.layout.neighbors);
-                    free(level.layout.count);
-                }
-                free(level.diagonal);
-                free(level.boundary);
-                for (auto face : level.face) free(face);
-                free(level.solution);
-                free(level.rhs);
-                free(level.temporary);
-            }
-        delete[] pressure.levels;
-        free(pressure.direction);
-        free(pressure.product);
-        free(pressure.solution);
-        free(pressure.residual);
-        free(pressure.parents);
-        free(pressure.openComponents);
-        free(pressure.anchors);
-        free(pressure.reductions);
-        free(pressure.iteration);
-        if (pressure.graph) cudaGraphExecDestroy(pressure.graph);
-        free(sources);
-        free(colliders);
-        for (auto mesh : meshes) {
-            free(mesh.triangles);
-            free(mesh.nodes);
-            free(mesh.order);
-        }
-        free(error);
-        free(maximum);
-        free(densityDevice);
-        free(densityCount);
-        free(gridDevice);
-        cudaStreamSynchronize(stream);
-        if (densityHost) cudaFreeHost(densityHost);
-        if (gridHost) cudaFreeHost(gridHost);
-        cudaStreamDestroy(stream);
+        release_storage();
     }
 
     void Solver::set_sources(const Source* data, int count) {
+        bool changed = sourceInputs.size() != static_cast<std::size_t>(count);
+        for (int i = 0; i < count && !changed; ++i) {
+            const auto& current  = data[i];
+            const auto& previous = sourceInputs[i];
+            changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.center != previous.center || current.halfExtent != previous.halfExtent || current.velocity != previous.velocity || current.smokeRate != previous.smokeRate || current.temperatureRate != previous.temperatureRate || current.velocityRate != previous.velocityRate || current.startTime != previous.startTime || current.endTime != previous.endTime || current.inheritVelocity != previous.inheritVelocity;
+            if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(current.motion.derivative, [](float value) { return value != 0; }) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
+        }
+        if (!changed && sourceCount == count) return;
+        topologyDirty |= changed;
+        sourceInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
         if (count > sourceCapacity) {
             release(sources, sourceCapacity);
             allocate(sources, count);
@@ -159,45 +48,29 @@ namespace pyro::sparse {
         sourceCount = count;
         if (!count) return;
         std::vector<cuda::Source> upload(count);
-        for (int i = 0; i < count; ++i) {
-            const auto& source     = data[i];
-            auto& target           = upload[i];
-            target.center          = std::bit_cast<float3>(source.center);
-            target.halfExtent      = std::bit_cast<float3>(source.halfExtent);
-            target.velocity        = std::bit_cast<float3>(source.velocity);
-            target.smokeRate       = source.smokeRate;
-            target.temperatureRate = source.temperatureRate;
-            target.velocityRate    = source.velocityRate;
-            target.startTime       = source.startTime;
-            target.endTime         = source.endTime;
-            target.shape           = static_cast<cuda::Shape>(source.shape);
-            target.mesh            = source.shape == Shape::mesh ? meshes[source.mesh] : cuda::Mesh{};
-            target.motion          = std::bit_cast<cuda::Motion>(source.motion);
-            target.inheritVelocity = source.inheritVelocity;
-        }
+        for (int i = 0; i < count; ++i) upload[i] = device_input(data[i], meshes);
         cuda_check(cudaMemcpyAsync(sources, upload.data(), count * sizeof(cuda::Source), cudaMemcpyHostToDevice, stream));
         synchronize();
     }
-
     void Solver::set_colliders(const Collider* data, int count) {
-        geometryDirty       = geometryDirty || !grid.staticGeometry || colliderInputs.size() != static_cast<std::size_t>(count);
-        grid.staticGeometry = true;
+        bool changed   = movingGeometry || colliderInputs.size() != static_cast<std::size_t>(count);
+        movingGeometry = false;
         for (int i = 0; i < count; ++i) {
             const auto& current = data[i];
-            if (current.shape == Shape::mesh) {
-                for (float derivative : current.motion.derivative) grid.staticGeometry &= derivative == 0.0f;
-            } else {
-                for (float velocity : current.linearVelocity) grid.staticGeometry &= velocity == 0.0f;
-                for (float velocity : current.angularVelocity) grid.staticGeometry &= velocity == 0.0f;
-            }
-            if (!geometryDirty) {
+            if (current.shape == Shape::mesh) movingGeometry |= std::ranges::any_of(current.motion.derivative, [](float value) { return value != 0; });
+            else movingGeometry |= current.linearVelocity != std::array<float, 3>{} || current.angularVelocity != std::array<float, 3>{};
+            if (!changed) {
                 const auto& previous = colliderInputs[i];
-                geometryDirty        = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
-                if (current.shape == Shape::mesh) geometryDirty |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix);
-                else geometryDirty |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation;
+                changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
+                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
+                else changed |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation || previous.linearVelocity != std::array<float, 3>{} || previous.angularVelocity != std::array<float, 3>{};
             }
         }
-        geometryDirty |= !grid.staticGeometry;
+        changed |= movingGeometry;
+        grid.staticGeometry = spare.staticGeometry = !movingGeometry;
+        if (!changed && colliderCount == count) return;
+        topologyDirty |= changed;
+        geometryDirty |= changed;
         colliderInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
         if (count > colliderCapacity) {
             release(colliders, colliderCapacity);
@@ -207,200 +80,227 @@ namespace pyro::sparse {
         colliderCount = count;
         if (!count) return;
         std::vector<cuda::Collider> upload(count);
-        for (int i = 0; i < count; ++i) {
-            const auto& collider   = data[i];
-            auto& target           = upload[i];
-            target.center          = std::bit_cast<float3>(collider.center);
-            target.halfExtent      = std::bit_cast<float3>(collider.halfExtent);
-            target.orientation     = std::bit_cast<float4>(collider.orientation);
-            target.linearVelocity  = std::bit_cast<float3>(collider.linearVelocity);
-            target.angularVelocity = std::bit_cast<float3>(collider.angularVelocity);
-            target.poseTime        = collider.poseTime;
-            target.shape           = static_cast<cuda::Shape>(collider.shape);
-            target.mesh            = collider.shape == Shape::mesh ? meshes[collider.mesh] : cuda::Mesh{};
-            target.motion          = std::bit_cast<cuda::Motion>(collider.motion);
-            target.surfaceOffset   = collider.surfaceOffset;
-        }
+        for (int i = 0; i < count; ++i) upload[i] = device_input(data[i], meshes);
         cuda_check(cudaMemcpyAsync(colliders, upload.data(), count * sizeof(cuda::Collider), cudaMemcpyHostToDevice, stream));
         synchronize();
     }
-
     int Solver::add_mesh(std::span<const Triangle> triangles) {
-        cuda::Mesh mesh;
-        mesh.triangleCount = static_cast<int>(triangles.size());
-        mesh.leafCount     = static_cast<int>(std::bit_ceil(triangles.size()));
-        mesh.band          = config.cellSize * 4.0f;
-        mesh.bounds        = {{1.0e30f, 1.0e30f, 1.0e30f}, {-1.0e30f, -1.0e30f, -1.0e30f}};
-        for (auto t : triangles)
-            for (auto p : {t.a, t.b, t.c}) {
-                mesh.bounds.lower = {std::min(mesh.bounds.lower.x, p[0]), std::min(mesh.bounds.lower.y, p[1]), std::min(mesh.bounds.lower.z, p[2])};
-                mesh.bounds.upper = {std::max(mesh.bounds.upper.x, p[0]), std::max(mesh.bounds.upper.y, p[1]), std::max(mesh.bounds.upper.z, p[2])};
-            }
-        allocate(mesh.triangles, mesh.triangleCount);
-        allocate(mesh.order, mesh.triangleCount);
-        allocate(mesh.nodes, mesh.leafCount * 2);
-        cuda_check(cudaMemcpyAsync(mesh.triangles, triangles.data(), triangles.size_bytes(), cudaMemcpyHostToDevice, stream));
-        cuda::build_mesh(mesh, stream);
-        synchronize();
+        auto mesh = upload_mesh(triangles, config.cellSize * 4, stream);
         meshes.push_back(mesh);
+        statistics.allocatedBytes += triangles.size() * (sizeof(cuda::Triangle) + sizeof(int)) + mesh.leafCount * 2ull * sizeof(cuda::Bounds);
         return static_cast<int>(meshes.size()) - 1;
     }
-
     void Solver::advance(double duration) {
         auto begin                = std::chrono::steady_clock::now();
         auto bytes                = statistics.allocatedBytes;
         statistics                = {};
         statistics.allocatedBytes = bytes;
-        double endTime            = time + duration;
-        while (time < endTime) {
-            if (!grid.staticGeometry || geometryDirty) {
-                cuda::sample_geometry(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time), 0, false, stream);
-                cuda::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time), 0, false, stream);
-                geometryDirty = false;
+        statistics.capacity       = grid.layout.capacity;
+        std::vector<float*> phases;
+        auto start = [&] {
+            if (phases.size() == events.size()) {
+                events.push_back({});
+                for (auto& event : events.back()) cuda_check(cudaEventCreate(&event));
             }
-            cuda::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, false, stream);
-            float bounds[2];
-            cuda_check(cudaMemcpyAsync(bounds, maximum, sizeof(bounds), cudaMemcpyDeviceToHost, stream));
+            cuda_check(cudaEventRecord(events[phases.size()][0], stream));
+        };
+        auto finish = [&](float& phase) {
+            cuda_check(cudaEventRecord(events[phases.size()][1], stream));
+            phases.push_back(&phase);
+        };
+        auto measure = [&](bool full) {
+            std::array<double, 6> result{};
+            cuda::sparse::measure(grid, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), full, pressure.reductions, stream);
+            int count = full ? 6 : 2;
+            cuda_check(cudaMemcpyAsync(result.data(), pressure.reductions + grid.layout.count * static_cast<unsigned long long>(count), count * sizeof(double), cudaMemcpyDeviceToHost, stream));
             synchronize();
-            // Stable positive root of v*dt + a*dt^2 <= CFL*h, including source acceleration.
-            float distance     = config.cfl * config.cellSize;
-            float safeStep     = 2.0f * distance / (bounds[0] + std::sqrt(bounds[0] * bounds[0] + 4.0f * bounds[1] * distance) + 1.0e-20f);
-            float dt           = static_cast<float>(std::min(endTime - time, static_cast<double>(std::min(config.maxTimeStep, safeStep))));
-            auto topologyBegin = std::chrono::steady_clock::now();
-            cuda::request_topology(grid, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), dt, error, stream);
-            std::swap(grid.layout.keys, grid.nextKeys);
-            std::swap(grid.layout.indices, grid.nextIndices);
-            int deviceError;
-            cuda_check(cudaMemcpyAsync(&grid.layout.blocks, grid.layout.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaMemcpyAsync(&deviceError, error, sizeof(int), cudaMemcpyDeviceToHost, stream));
-            synchronize();
-            if (deviceError) throw std::runtime_error("Sparse block pool exhausted; increase Config::maxBlocks.");
-            cuda::initialize_topology(grid, parameters.wind, stream);
-            hierarchyDirty        = true;
+            return result;
+        };
+        double endTime = time + duration;
+        while (time < endTime) {
+            if (geometryDirty || movingGeometry) {
+                start();
+                cuda::sparse::sample_geometry(grid, {}, nullptr, colliders, colliderCount, static_cast<float>(time), 0, stream);
+                cuda::sparse::geometry(grid, colliders, colliderCount, static_cast<float>(time), 0, stream);
+                finish(statistics.geometryMilliseconds);
+                geometryDirty = false;
+                matrixDirty   = true;
+            }
+            if (topologyDirty || substep % config.adaptInterval == 0) {
+                start();
+                bool changed;
+                for (;;) {
+                    int count = cuda::sparse::adapt(grid, spare, topology, scratch, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), config.maxTimeStep * config.adaptInterval, changed, stream);
+                    if (count <= grid.layout.capacity) {
+                        spare.layout.count = count;
+                        break;
+                    }
+                    reserve(count);
+                }
+                if (changed) {
+                    cuda::sparse::build_connectivity(spare, stream);
+                    cuda::sparse::sample_geometry(spare, grid.layout, grid.staticGeometry ? grid.distance[0] : nullptr, colliders, colliderCount, static_cast<float>(time), 0, stream);
+                    cuda::sparse::geometry(spare, colliders, colliderCount, static_cast<float>(time), 0, stream);
+                    cuda::sparse::remap(grid, spare, parameters, stream);
+                    std::swap(grid, spare);
+                    matrixDirty = true;
+                } else if (grid.layout.count) cuda_check(cudaMemcpyAsync(grid.layout.blocks, spare.layout.blocks, grid.layout.count * sizeof(cuda::sparse::Block), cudaMemcpyDeviceToDevice, stream));
+                topologyDirty = false;
+                finish(statistics.topologyMilliseconds);
+                if (changed && grid.layout.count) {
+                    start();
+                    project(grid.state);
+                    finish(statistics.projectionMilliseconds);
+                }
+            }
+            if (!grid.layout.count) {
+                time = sourceCount ? std::min(endTime, time + config.maxTimeStep) : endTime;
+                ++substep;
+                ++statistics.substeps;
+                continue;
+            }
+            start();
+            auto bounds = measure(false);
+            finish(statistics.statisticsMilliseconds);
+            float distance        = config.cfl * config.cellSize;
+            float safeStep        = 2.f * distance / (static_cast<float>(bounds[0]) + std::sqrt(static_cast<float>(bounds[0] * bounds[0] + 4 * bounds[1] * distance)) + 1.e-20f);
+            double step           = std::min(endTime - time, static_cast<double>(std::min(config.maxTimeStep, safeStep)));
+            float dt              = static_cast<float>(step);
             grid.geometryTime     = static_cast<float>(time);
             grid.geometryDuration = dt;
-            int samples           = grid.staticGeometry ? 1 : 3;
-            for (int sample = 0; sample < samples; ++sample) cuda::sample_geometry(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time) + dt * (0.5f * sample), sample, grid.staticGeometry, stream);
-            cuda::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time), 0, grid.staticGeometry, stream);
-            synchronize();
-            statistics.topologyMilliseconds += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - topologyBegin).count();
-            if (grid.layout.blocks) {
-                cuda::advect(grid, parameters, grid.midpoint, grid.state, grid.state, colliders, colliderCount, static_cast<float>(time), dt * 0.5f, stream);
-                cuda::apply_sources_forces(grid, parameters, grid.midpoint, grid.state, sources, sourceCount, static_cast<float>(time), dt * 0.5f, stream);
-                if (!grid.staticGeometry) cuda::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time) + dt * 0.5f, 1, false, stream);
-                project(grid.midpoint);
-                cuda::advect(grid, parameters, grid.next, grid.state, grid.midpoint, colliders, colliderCount, static_cast<float>(time), dt, stream);
-                cuda::apply_sources_forces(grid, parameters, grid.next, grid.midpoint, sources, sourceCount, static_cast<float>(time), dt, stream);
-                if (!grid.staticGeometry) cuda::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time) + dt, 2, false, stream);
-                project(grid.next);
-                std::swap(grid.state, grid.next);
+            if (movingGeometry) {
+                start();
+                for (int sample = 1; sample < 3; ++sample) cuda::sparse::sample_geometry(grid, {}, nullptr, colliders, colliderCount, static_cast<float>(time) + dt * (.5f * sample), sample, stream);
+                finish(statistics.geometryMilliseconds);
             }
-            time += dt;
+            for (int stage = 0; stage < 2; ++stage) {
+                float stageStep  = stage ? dt : .5f * dt;
+                auto destination = stage ? grid.next : grid.midpoint;
+                auto carrier     = stage ? grid.midpoint : grid.state;
+                start();
+                cuda::sparse::advect(grid, destination, carrier, parameters, colliders, colliderCount, static_cast<float>(time), stageStep, stream);
+                finish(statistics.advectionMilliseconds);
+                start();
+                cuda::sparse::forces(grid, destination, carrier, parameters, sources, sourceCount, static_cast<float>(time), stageStep, stream);
+                finish(statistics.forcesMilliseconds);
+                if (movingGeometry) {
+                    start();
+                    cuda::sparse::geometry(grid, colliders, colliderCount, static_cast<float>(time) + stageStep, stage + 1, stream);
+                    finish(statistics.geometryMilliseconds);
+                    matrixDirty = true;
+                }
+                start();
+                project(destination);
+                finish(statistics.projectionMilliseconds);
+            }
+            std::swap(grid.state, grid.next);
+            spare.midpoint    = grid.midpoint;
+            spare.next        = grid.next;
+            spare.transported = grid.transported;
+            time += step;
+            ++substep;
             ++statistics.substeps;
         }
-        cuda::measure(grid, grid.state, parameters, sources, sourceCount, colliders, colliderCount, static_cast<float>(time), pressure.reductions, maximum, true, stream);
-        double result[6];
-        cuda_check(cudaMemcpyAsync(result, pressure.reductions + config.maxBlocks * 6ull, sizeof(result), cudaMemcpyDeviceToHost, stream));
-        synchronize();
-        statistics.blocks              = grid.layout.blocks;
+        start();
+        auto result = measure(true);
+        finish(statistics.statisticsMilliseconds);
+        statistics.blocks              = grid.layout.count;
         statistics.fluidCells          = static_cast<int>(result[0]);
         statistics.maxDivergence       = static_cast<float>(result[1]);
         statistics.maxSpeed            = static_cast<float>(result[2]);
         statistics.smokeIntegral       = result[3];
         statistics.temperatureIntegral = result[4];
-        statistics.stepMilliseconds    = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
-        if (!std::isfinite(statistics.maxDivergence) || statistics.maxDivergence > config.divergenceTolerance) throw std::runtime_error("Projection divergence " + std::to_string(statistics.maxDivergence) + " exceeds " + std::to_string(config.divergenceTolerance));
+        cuda_check(cudaEventSynchronize(events[phases.size() - 1][1]));
+        for (std::size_t i = 0; i < phases.size(); ++i) {
+            float ms;
+            cuda_check(cudaEventElapsedTime(&ms, events[i][0], events[i][1]));
+            *phases[i] += ms;
+        }
+        statistics.stepMilliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        if (!std::isfinite(statistics.maxDivergence) || statistics.maxDivergence > config.divergenceTolerance) throw std::runtime_error("Sparse projection divergence " + std::to_string(statistics.maxDivergence) + " exceeds " + std::to_string(config.divergenceTolerance));
     }
-
     void Solver::synchronize() {
         cuda_check(cudaGetLastError());
         cuda_check(cudaStreamSynchronize(stream));
     }
-
     void Solver::checkpoint(const char* path, bool restore) {
         synchronize();
         std::fstream file(path, std::ios::binary | (restore ? std::ios::in : std::ios::out | std::ios::trunc));
         file.exceptions(std::ios::badbit | std::ios::failbit);
-        auto scalar = [&]<typename T>(T& value) {
-            if (restore) file.read(reinterpret_cast<char*>(&value), sizeof(T));
-            else file.write(reinterpret_cast<const char*>(&value), sizeof(T));
+        auto transfer = [&](void* data, std::size_t size) {
+            if (restore) file.read(static_cast<char*>(data), size);
+            else file.write(static_cast<const char*>(data), size);
         };
-        auto deviceArray = [&]<typename T>(T* device, std::size_t count) {
-            std::vector<T> host(count);
-            if (restore) {
-                file.read(reinterpret_cast<char*>(host.data()), count * sizeof(T));
-                if (count) cuda_check(cudaMemcpyAsync(device, host.data(), count * sizeof(T), cudaMemcpyHostToDevice, stream));
-            } else {
-                if (count) cuda_check(cudaMemcpyAsync(host.data(), device, count * sizeof(T), cudaMemcpyDeviceToHost, stream));
+        constexpr std::array format{'P', 'Y', 'R', 'O', 'S', 'P', '0', '1'};
+        auto storedFormat = format;
+        transfer(storedFormat.data(), storedFormat.size());
+        if (storedFormat != format) throw std::runtime_error("Unsupported sparse checkpoint format");
+        transfer(&time, sizeof(time));
+        transfer(&substep, sizeof(substep));
+        int count = grid.layout.count;
+        transfer(&count, sizeof(count));
+        if (restore) {
+            grid.layout.count = 0;
+            reserve(count);
+            grid.layout.count = count;
+        }
+        std::vector<GridBlock> blocks(grid.layout.count);
+        if (!restore) {
+            cuda_check(cudaMemcpyAsync(blocks.data(), grid.layout.blocks, blocks.size() * sizeof(GridBlock), cudaMemcpyDeviceToHost, stream));
+            synchronize();
+        }
+        transfer(blocks.data(), blocks.size() * sizeof(GridBlock));
+        if (restore) cuda_check(cudaMemcpyAsync(grid.layout.blocks, blocks.data(), blocks.size() * sizeof(GridBlock), cudaMemcpyHostToDevice, stream));
+        int field = 0;
+        for (auto pointer : {grid.state.smoke, grid.state.temperature, grid.state.velocity}) {
+            std::vector<float> buffer(grid.layout.count * (field++ < 2 ? 512ull : 1728ull));
+            if (!restore) {
+                cuda_check(cudaMemcpyAsync(buffer.data(), pointer, buffer.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
                 synchronize();
-                file.write(reinterpret_cast<const char*>(host.data()), count * sizeof(T));
             }
+            transfer(buffer.data(), buffer.size() * sizeof(float));
+            if (restore) cuda_check(cudaMemcpyAsync(pointer, buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
             synchronize();
-        };
-        unsigned long long format = 0x32305453524f5950ull;
-        scalar(format);
-        scalar(time);
-        scalar(grid.layout.blocks);
-        int freeCount = 0;
-        if (!restore && grid.layout.blocks) cuda_check(cudaMemcpyAsync(&freeCount, grid.freeCount, sizeof(int), cudaMemcpyDeviceToHost, stream));
-        synchronize();
-        scalar(freeCount);
-        deviceArray(grid.freeBlocks, freeCount);
-        deviceArray(grid.layout.keys, grid.layout.tableCapacity);
-        deviceArray(grid.layout.indices, grid.layout.tableCapacity);
-        cuda::StateBlock* packed = nullptr;
-        if (grid.layout.blocks) allocate(packed, grid.layout.blocks);
-        try {
-            if (!restore) cuda::transfer_state(grid, packed, false, stream);
-            deviceArray(packed, grid.layout.blocks);
-            if (restore) {
-                cuda::transfer_state(grid, packed, true, stream);
-                cuda_check(cudaMemcpyAsync(grid.layout.count, &grid.layout.blocks, sizeof(int), cudaMemcpyHostToDevice, stream));
-                cuda_check(cudaMemcpyAsync(grid.freeCount, &freeCount, sizeof(int), cudaMemcpyHostToDevice, stream));
-                cuda::build_neighbors(grid.layout, stream);
-                hierarchyDirty = true;
-                geometryDirty  = true;
-            }
-            synchronize();
-        } catch (...) {
-            release(packed, grid.layout.blocks);
-            throw;
         }
-        release(packed, grid.layout.blocks);
+        // Input snapshots preserve adaptation scheduling across a restart while
+        // still detecting a changed scene on the first upload after restore.
+        int savedSources = static_cast<int>(sourceInputs.size());
+        transfer(&savedSources, sizeof(savedSources));
+        if (restore) sourceInputs.resize(savedSources);
+        if (savedSources) transfer(sourceInputs.data(), savedSources * sizeof(Source));
+        int savedColliders = static_cast<int>(colliderInputs.size());
+        transfer(&savedColliders, sizeof(savedColliders));
+        if (restore) colliderInputs.resize(savedColliders);
+        if (savedColliders) transfer(colliderInputs.data(), savedColliders * sizeof(Collider));
+        if (restore) {
+            cuda::sparse::rebuild_hash(grid.layout, stream);
+            cuda::sparse::build_connectivity(grid, stream);
+            const auto restoredSources   = sourceInputs;
+            const auto restoredColliders = colliderInputs;
+            sourceCount = colliderCount = -1;
+            set_sources(restoredSources.data(), savedSources);
+            set_colliders(restoredColliders.data(), savedColliders);
+            geometryDirty = matrixDirty = true;
+            topologyDirty               = false;
+        }
     }
-
     std::span<const DensityBlock> Solver::download_density() {
-        if (!densityDevice) {
-            allocate(densityDevice, config.maxBlocks);
-            allocate(densityCount, 1);
-            cuda_check(cudaMallocHost(reinterpret_cast<void**>(&densityHost), config.maxBlocks * sizeof(DensityBlock)));
-        }
-        cuda::pack_density(grid, densityDevice, densityCount, stream);
-        int count;
-        cuda_check(cudaMemcpyAsync(&count, densityCount, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        density.resize(grid.layout.count);
+        if (density.empty()) return density;
+        cuda::sparse::DensityBlock* device{};
+        cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&device), density.size() * sizeof(DensityBlock), stream));
+        cuda::sparse::pack_density(grid, device, stream);
+        cuda_check(cudaMemcpyAsync(density.data(), device, density.size() * sizeof(DensityBlock), cudaMemcpyDeviceToHost, stream));
+        cuda_check(cudaFreeAsync(device, stream));
         synchronize();
-        if (count) cuda_check(cudaMemcpyAsync(densityHost, densityDevice, count * sizeof(DensityBlock), cudaMemcpyDeviceToHost, stream));
-        synchronize();
-        return {densityHost, static_cast<std::size_t>(count)};
+        return density;
     }
-
-    std::span<const GridBlock> Solver::download_grid() {
-        if (!gridDevice) {
-            allocate(gridDevice, config.maxBlocks);
-            cuda_check(cudaMallocHost(reinterpret_cast<void**>(&gridHost), config.maxBlocks * sizeof(GridBlock)));
-        }
-        cuda::pack_grid(grid, gridDevice, stream);
-        if (grid.layout.blocks) cuda_check(cudaMemcpyAsync(gridHost, gridDevice, grid.layout.blocks * sizeof(GridBlock), cudaMemcpyDeviceToHost, stream));
-        synchronize();
-        return {gridHost, static_cast<std::size_t>(grid.layout.blocks)};
-    }
-
     template <typename T>
     void Solver::allocate(T*& pointer, unsigned long long count) {
         cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&pointer), count * sizeof(T), stream));
+        cuda_check(cudaMemsetAsync(pointer, 0, count * sizeof(T), stream));
         statistics.allocatedBytes += count * sizeof(T);
     }
-
     template <typename T>
     void Solver::release(T*& pointer, unsigned long long count) {
         if (!pointer) return;
@@ -408,118 +308,276 @@ namespace pyro::sparse {
         pointer = nullptr;
         statistics.allocatedBytes -= count * sizeof(T);
     }
-
-    void Solver::allocate_layout(cuda::Layout& layout, int capacity) {
-        layout.capacity      = capacity;
-        layout.tableCapacity = 1;
-        while (layout.tableCapacity < capacity * 4) layout.tableCapacity <<= 1;
-        allocate(layout.keys, layout.tableCapacity);
-        allocate(layout.indices, layout.tableCapacity);
-        allocate(layout.coordinates, capacity);
-        allocate(layout.active, capacity);
-        allocate(layout.neighbors, capacity * 6);
-        allocate(layout.count, 1);
-        cuda_check(cudaMemsetAsync(layout.keys, 255, layout.tableCapacity * sizeof(unsigned long long), stream));
-        cuda_check(cudaMemsetAsync(layout.indices, 255, layout.tableCapacity * sizeof(int), stream));
-        cuda_check(cudaMemsetAsync(layout.count, 0, sizeof(int), stream));
-    }
-
-    void Solver::free_layout(cuda::Layout& layout) {
-        release(layout.keys, layout.tableCapacity);
-        release(layout.indices, layout.tableCapacity);
-        release(layout.coordinates, layout.capacity);
-        release(layout.active, layout.capacity);
-        release(layout.neighbors, layout.capacity * 6);
-        release(layout.count, 1);
-        layout = {};
-    }
-
-    void Solver::project(cuda::Fields fields) {
-        auto& workspace = pressure;
-        auto& fine      = workspace.levels[0];
-        fine.layout     = grid.layout;
-        if (!fine.layout.blocks) return;
-        auto begin = std::chrono::steady_clock::now();
-        // Only the RHS changes between the two projections with stationary geometry.
-        bool rebuild = hierarchyDirty || !grid.staticGeometry;
-        cuda::assemble_pressure(grid, fields, workspace, config.cellSize, colliderCount != 0, rebuild, stream);
-        workspace.levelCount = 1;
-        for (int l = 1; l < config.maxPressureLevels; ++l) {
-            auto& previous = workspace.levels[l - 1];
-            auto& level    = workspace.levels[l];
-            if (hierarchyDirty && level.layout.capacity < previous.layout.blocks) {
-                free_layout(level.layout);
-                allocate_layout(level.layout, previous.layout.blocks);
-            }
-            if (hierarchyDirty) {
-                cuda::coarse_topology(previous.layout, level.layout, stream);
-                cuda_check(cudaMemcpyAsync(&level.layout.blocks, level.layout.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-                cuda_check(cudaStreamSynchronize(stream));
-            }
-            if (level.storageCapacity < level.layout.blocks) {
-                auto old = static_cast<unsigned long long>(level.storageCapacity) * cuda::blockCells;
-                release(level.diagonal, old);
-                release(level.boundary, old);
-                for (auto& face : level.face) release(face, old);
-                release(level.solution, old);
-                release(level.rhs, old);
-                release(level.temporary, old);
-                level.storageCapacity = level.layout.blocks + level.layout.blocks / 4;
-                auto size             = static_cast<unsigned long long>(level.storageCapacity) * cuda::blockCells;
-                allocate(level.diagonal, size);
-                allocate(level.boundary, size);
-                for (auto& face : level.face) allocate(face, size);
-                allocate(level.solution, size);
-                allocate(level.rhs, size);
-                allocate(level.temporary, size);
-            }
-            if (rebuild) cuda::coarse_matrix(previous, level, stream);
-            ++workspace.levelCount;
-            if (l >= 6 && level.layout.blocks <= 8) break;
+    template <typename T>
+    void Solver::resize(T*& pointer, unsigned long long previousCount, unsigned long long count, unsigned long long retained) {
+        if (!retained) {
+            release(pointer, previousCount);
+            allocate(pointer, count);
+            return;
         }
-        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(cuda::IterationState), stream));
-        cuda::begin_pressure(workspace, parameters, stream);
-        auto executable = workspace.graph;
-        if (hierarchyDirty) {
-            if (executable) cuda_check(cudaGraphExecDestroy(executable));
-            workspace.graph = nullptr;
+        T* previous = pointer;
+        pointer     = nullptr;
+        try {
+            allocate(pointer, count);
+            cuda_check(cudaMemcpyAsync(pointer, previous, retained * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+        } catch (...) {
+            cudaFreeAsync(previous, stream);
+            throw;
+        }
+        release(previous, previousCount);
+    }
+    void Solver::reserve(int required) {
+        int previous = grid.layout.capacity;
+        if (required <= previous) return;
+        int capacity       = static_cast<int>(std::bit_ceil(static_cast<unsigned>(std::max(required, previous * 2))));
+        int tableSize      = static_cast<int>(std::bit_ceil(static_cast<unsigned>(capacity * 8)));
+        auto previousCells = previous * 512ull, cells = capacity * 512ull;
+        auto previousFaces = previous * 1728ull, faces = capacity * 1728ull;
+        synchronize();
+        if (pressure.graph) {
+            cuda_check(cudaGraphExecDestroy(pressure.graph));
+            pressure.graph = nullptr;
+        }
+        matrixDirty = true;
+        // Grow one allocation at a time. Only the live grid is retained; all
+        // transport, regrid and pressure workspaces are rebuilt before use.
+        for (auto* g : {&grid, &spare}) {
+            auto retained = g == &grid ? static_cast<unsigned long long>(grid.layout.count) : 0;
+            resize(g->layout.blocks, previous, capacity, retained);
+            resize(g->layout.keys, g->layout.tableSize, tableSize);
+            resize(g->layout.indices, g->layout.tableSize, tableSize);
+            resize(g->faces, previousFaces, faces, retained * 1728);
+            resize(g->links, previous * 384ull, capacity * 384ull, retained * 384);
+            resize(g->fluid, previousCells, cells, retained * 512);
+            resize(g->solidDivergence, previousCells, cells, retained * 512);
+            for (auto& distance : g->distance) resize(distance, previous * 729ull, capacity * 729ull, retained * 729);
+            resize(g->state.smoke, previousCells, cells, retained * 512);
+            resize(g->state.temperature, previousCells, cells, retained * 512);
+            resize(g->state.velocity, previousFaces, faces, retained * 1728);
+            g->state.samples    = nullptr;
+            g->layout.count     = static_cast<int>(retained);
+            g->layout.capacity  = capacity;
+            g->layout.tableSize = tableSize;
+            g->layout.levels    = config.levels;
+            g->layout.h         = config.cellSize;
+            cuda::sparse::rebuild_hash(g->layout, stream);
+        }
+        for (auto* fields : {&grid.midpoint, &grid.next, &grid.transported}) {
+            resize(fields->smoke, previousCells, cells);
+            resize(fields->temperature, previousCells, cells);
+            resize(fields->velocity, previousFaces, faces);
+            fields->samples = nullptr;
+        }
+        spare.midpoint    = grid.midpoint;
+        spare.next        = grid.next;
+        spare.transported = grid.transported;
+        for (int i = 0; i < 3; ++i) {
+            resize(grid.samples[i], previous * 5ull * 1331, capacity * 5ull * 1331);
+            spare.samples[i] = grid.samples[i];
+        }
+        resize(grid.uniformSamples, previous * 5ull * 1331, capacity * 5ull * 1331);
+        spare.uniformSamples = grid.uniformSamples;
+        resize(topology.roots, topology.tableSize, tableSize);
+        resize(topology.refine, topology.tableSize, tableSize);
+        resize(topology.decision, previous, capacity);
+        resize(topology.quiet, previous, capacity);
+        resize(topology.remaining, previous, capacity);
+        resize(topology.split, previous, capacity);
+        resize(topology.candidates, previous, capacity);
+        topology.tableSize = tableSize;
+        topology.capacity  = capacity;
+        for (auto& pointer : scratch.keys) release(pointer, scratch.capacity);
+        for (auto& pointer : scratch.values) release(pointer, scratch.capacity);
+        release(scratch.count, 1);
+        if (scratch.sortStorage) {
+            cuda_check(cudaFreeAsync(scratch.sortStorage, stream));
+            statistics.allocatedBytes -= scratch.sortBytes;
+        }
+        scratch   = {};
+        int edges = capacity * (config.levels > 1 ? 4032 : 1728);
+        cuda::sparse::initialize_scratch(scratch, std::max(edges, tableSize), stream);
+        statistics.allocatedBytes += scratch.capacity * 32ull + scratch.sortBytes + sizeof(int);
+        auto& fine = pressure.levels[0];
+        resize(fine.nodes, previousCells, cells);
+        resize(fine.parent, previousCells, cells);
+        resize(fine.edges, fine.edgeCapacity, edges);
+        resize(fine.faceWeights, previousFaces, faces);
+        resize(fine.boundary, previousCells, cells);
+        resize(fine.diagonal, previousCells, cells);
+        resize(fine.rhs, previousCells, cells);
+        resize(fine.solution, previousCells, cells);
+        resize(fine.temporary, previousCells, cells);
+        fine.capacity     = static_cast<int>(cells);
+        fine.edgeCapacity = edges;
+        resize(pressure.solution, previousCells, cells);
+        resize(pressure.residual, previousCells, cells);
+        resize(pressure.direction, previousCells, cells);
+        resize(pressure.product, previousCells, cells);
+        resize(pressure.componentSums, previousCells, cells);
+        resize(pressure.components, previousCells, cells);
+        resize(pressure.open, previousCells, cells);
+        resize(pressure.anchors, previousCells, cells);
+        resize(pressure.reductions, (previous + 1ull) * 6, (capacity + 1ull) * 6);
+        statistics.capacity = capacity;
+        synchronize();
+    }
+    void Solver::build_pressure() {
+        if (pressure.graph) {
+            cuda_check(cudaGraphExecDestroy(pressure.graph));
+            pressure.graph = nullptr;
+        }
+        auto& fine          = pressure.levels[0];
+        fine.count          = grid.layout.count * 512;
+        fine.edgeCount      = grid.layout.count * (config.levels > 1 ? 4032 : 1728);
+        pressure.closed     = cuda::sparse::fine_matrix(grid, pressure, colliderCount != 0, stream);
+        pressure.levelCount = 1;
+        for (int depth = 1; pressure.levels[depth - 1].count > 128; ++depth) {
+            auto& previous = pressure.levels[depth - 1];
+            auto& level    = pressure.levels[depth];
+            int count      = cuda::sparse::coarse_nodes(previous, {}, scratch, depth, stream);
+            if (count > level.capacity) {
+                release(level.nodes, level.capacity);
+                release(level.parent, level.capacity);
+                release(level.children, level.capacity * 8ull);
+                release(level.adjacency, level.capacity * 24ull);
+                release(level.boundary, level.capacity);
+                release(level.diagonal, level.capacity);
+                release(level.rhs, level.capacity);
+                release(level.solution, level.capacity);
+                release(level.temporary, level.capacity);
+                release(level.edges, level.edgeCapacity);
+                level.capacity     = count;
+                level.edgeCapacity = count * 12;
+                allocate(level.nodes, count);
+                allocate(level.parent, count);
+                allocate(level.children, count * 8ull);
+                allocate(level.adjacency, count * 24ull);
+                allocate(level.edges, level.edgeCapacity);
+                allocate(level.boundary, count);
+                allocate(level.diagonal, count);
+                allocate(level.rhs, count);
+                allocate(level.solution, count);
+                allocate(level.temporary, count);
+            }
+            level.count = count;
+            cuda::sparse::coarse_nodes(previous, level, scratch, depth, stream);
+            level.edgeCount = cuda::sparse::coarse_edges(previous, level, scratch, stream);
+            ++pressure.levelCount;
+        }
+        matrixDirty = false;
+    }
+    void Solver::project(cuda::sparse::Fields fields) {
+        if (matrixDirty) build_pressure();
+        cuda::sparse::assemble_rhs(grid, fields, pressure, stream);
+        cuda_check(cudaMemsetAsync(pressure.iteration, 0, sizeof(cuda::sparse::IterationState), stream));
+        cuda::sparse::begin_pressure(grid, pressure, parameters, stream);
+        if (!pressure.graph) {
             cudaGraph_t graph;
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-            for (int iteration = 0; iteration < 8; ++iteration) cuda::iterate_pressure(workspace, parameters, stream);
+            for (int i = 0; i < 8; ++i) cuda::sparse::iterate_pressure(grid, pressure, parameters, stream);
             cuda_check(cudaStreamEndCapture(stream, &graph));
-            cuda_check(cudaGraphInstantiate(&executable, graph, 0));
+            cuda_check(cudaGraphInstantiate(&pressure.graph, graph, 0));
             cuda_check(cudaGraphDestroy(graph));
-            workspace.graph = executable;
-            hierarchyDirty  = false;
         }
-        cuda::IterationState status{};
+        cuda::sparse::IterationState status{};
         for (;;) {
             int remaining = config.pressureMaxIterations - status.iterations;
-            if (remaining >= 8) cuda_check(cudaGraphLaunch(executable, stream));
+            if (remaining >= 8) cuda_check(cudaGraphLaunch(pressure.graph, stream));
             else
-                for (int i = 0; i < remaining; ++i) cuda::iterate_pressure(workspace, parameters, stream);
-            cuda_check(cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
+                for (int i = 0; i < remaining; ++i) cuda::sparse::iterate_pressure(grid, pressure, parameters, stream);
+            cuda_check(cudaMemcpyAsync(&status, pressure.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
+            synchronize();
             if (status.failed) break;
             if (status.converged || status.iterations >= config.pressureMaxIterations) {
                 status.converged = 0;
-                cuda_check(cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
-                cuda::check_pressure(workspace, parameters, stream);
-                cuda_check(cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
-                cuda_check(cudaStreamSynchronize(stream));
-                if (status.maxResidual <= config.divergenceTolerance * 0.5f || status.failed || status.iterations >= config.pressureMaxIterations) break;
-                // Restart from the true residual when FP32 recursive CG loses accuracy.
+                cuda_check(cudaMemcpyAsync(pressure.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
+                cuda::sparse::check_pressure(grid, pressure, parameters, stream);
+                cuda_check(cudaMemcpyAsync(&status, pressure.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
+                synchronize();
+                if (status.maxResidual <= config.divergenceTolerance * .5f || status.failed || status.iterations >= config.pressureMaxIterations) break;
                 status.converged = 0;
-                cuda_check(cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
-                cuda::begin_pressure(workspace, parameters, stream);
+                cuda_check(cudaMemcpyAsync(pressure.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
+                cuda::sparse::begin_pressure(grid, pressure, parameters, stream);
             }
         }
-        if (status.failed || status.maxResidual > config.divergenceTolerance * 0.5f) throw std::runtime_error("Pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true residual=" + std::to_string(status.maxResidual));
-        cuda::apply_pressure(grid, fields, workspace.solution, config.cellSize, parameters.wind, stream);
-        cuda_check(cudaStreamSynchronize(stream));
-        statistics.projectionMilliseconds += std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        if (status.failed || status.maxResidual > config.divergenceTolerance * .5f) throw std::runtime_error("Sparse pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true divergence residual=" + std::to_string(status.maxResidual));
+        cuda::sparse::apply_pressure(grid, fields, pressure.solution, stream);
         statistics.pressureIterations += status.iterations;
-        statistics.pressureLevels = workspace.levelCount;
+        statistics.pressureLevels = pressure.levelCount;
     }
-
+    void Solver::release_storage() {
+        auto free = [stream = stream](void* pointer) {
+            if (pointer) cudaFreeAsync(pointer, stream);
+        };
+        if (pressure.graph) cudaGraphExecDestroy(pressure.graph);
+        for (auto* g : {&grid, &spare}) {
+            free(g->layout.blocks);
+            free(g->layout.keys);
+            free(g->layout.indices);
+            free(g->faces);
+            free(g->links);
+            free(g->fluid);
+            free(g->solidDivergence);
+            for (auto distance : g->distance) free(distance);
+        }
+        for (auto field : {grid.state, spare.state, grid.midpoint, grid.next, grid.transported}) {
+            free(field.smoke);
+            free(field.temperature);
+            free(field.velocity);
+        }
+        for (auto pointer : grid.samples) free(pointer);
+        free(grid.uniformSamples);
+        free(topology.roots);
+        free(topology.refine);
+        free(topology.decision);
+        free(topology.quiet);
+        free(topology.remaining);
+        free(topology.split);
+        free(topology.candidates);
+        free(topology.counters);
+        for (auto pointer : scratch.keys) free(pointer);
+        for (auto pointer : scratch.values) free(pointer);
+        free(scratch.count);
+        free(scratch.sortStorage);
+        if (pressure.levels)
+            for (int l = 0; l < 32; ++l) {
+                auto level = pressure.levels[l];
+                free(level.nodes);
+                free(level.parent);
+                free(level.children);
+                free(level.edges);
+                free(level.faceWeights);
+                free(level.adjacency);
+                free(level.boundary);
+                free(level.diagonal);
+                free(level.rhs);
+                free(level.solution);
+                free(level.temporary);
+            }
+        delete[] pressure.levels;
+        free(pressure.solution);
+        free(pressure.residual);
+        free(pressure.direction);
+        free(pressure.product);
+        free(pressure.componentSums);
+        free(pressure.components);
+        free(pressure.open);
+        free(pressure.anchors);
+        free(pressure.reductions);
+        free(pressure.iteration);
+        free(sources);
+        free(colliders);
+        for (auto mesh : meshes) {
+            free(mesh.triangles);
+            free(mesh.order);
+            free(mesh.nodes);
+        }
+        for (auto pair : events)
+            for (auto event : pair)
+                if (event) cudaEventDestroy(event);
+        if (stream) {
+            cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+    }
 } // namespace pyro::sparse

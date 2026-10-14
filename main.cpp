@@ -21,12 +21,20 @@ int main(int argc, char** argv) try {
             for (auto& value : denseConfig.origin) value = std::stof(argv[++i]);
         else if (option == "--resolution")
             for (auto& value : denseConfig.resolution) value = std::stoi(argv[++i]);
-        else if (option == "--max-blocks") sparseConfig.maxBlocks = std::stoi(argv[++i]);
+        else if (option == "--initial-blocks") sparseConfig.initialBlocks = std::stoi(argv[++i]);
+        else if (option == "--levels") sparseConfig.levels = std::stoi(argv[++i]);
+        else if (option == "--adapt-interval") sparseConfig.adaptInterval = std::stoi(argv[++i]);
+        else if (option == "--relative-error") sparseConfig.relativeError = std::stof(argv[++i]);
+        else if (option == "--smoke-error") sparseConfig.smokeAbsoluteError = std::stof(argv[++i]);
+        else if (option == "--temperature-error") sparseConfig.temperatureAbsoluteError = std::stof(argv[++i]);
+        else if (option == "--velocity-error") sparseConfig.velocityAbsoluteError = std::stof(argv[++i]);
         else if (option == "--checkpoint") checkpoint = argv[++i];
         else if (option == "--resume") resume = argv[++i];
         else if (option == "--help") {
             std::cout << "pyro --solver sparse|dense --frames N --cell-size H\n"
-                         "     --origin X Y Z --resolution NX NY NZ --max-blocks N\n"
+                         "     --origin X Y Z --resolution NX NY NZ\n"
+                         "     --initial-blocks N --levels N --adapt-interval N --relative-error E\n"
+                         "     --smoke-error E --temperature-error E --velocity-error E\n"
                          "     --checkpoint PATH --resume PATH\n";
             return 0;
         } else throw std::runtime_error("Unknown option: " + std::string(option));
