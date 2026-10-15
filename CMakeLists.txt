@@ -32,7 +32,7 @@ include(cmake/cuda.cmake)
 add_library(pyro_geometry STATIC solver/geometry.cpp solver/geometry.cu)
 target_sources(pyro_geometry PUBLIC FILE_SET CXX_MODULES FILES solver/types.ixx solver/geometry.ixx)
 target_link_libraries(pyro_geometry PUBLIC CUDA::cudart)
-foreach(backend IN ITEMS sparse dense)
+foreach(backend IN ITEMS sparse dense lfm)
     add_library(pyro_${backend} STATIC
         solver/${backend}/solver.cpp
         solver/${backend}/grid.cu
@@ -43,7 +43,8 @@ foreach(backend IN ITEMS sparse dense)
     target_link_libraries(pyro_${backend} PUBLIC pyro_geometry)
 endforeach()
 target_sources(pyro_sparse PRIVATE solver/sparse/transfer.cu)
-foreach(target IN ITEMS pyro_geometry pyro_sparse pyro_dense)
+target_sources(pyro_lfm PRIVATE solver/lfm/flow_map.cu)
+foreach(target IN ITEMS pyro_geometry pyro_sparse pyro_dense pyro_lfm)
     target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>")
     target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>")
 endforeach()
@@ -53,7 +54,7 @@ endforeach()
 # ============================================================================
 add_executable(pyro main.cpp io/stream.cpp)
 target_sources(pyro PRIVATE FILE_SET CXX_MODULES FILES io/stream.ixx)
-target_link_libraries(pyro PRIVATE pyro_sparse pyro_dense)
+target_link_libraries(pyro PRIVATE pyro_sparse pyro_dense pyro_lfm)
 
 # ============================================================================
 # Blender (Windows).

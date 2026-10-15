@@ -35,6 +35,7 @@ class PYRO_UL_objects(bpy.types.UIList):
 
 def draw_simulation(layout, context):
     scene, props = context.scene, context.scene.pyro
+    lfm = props.algorithm == "LFM"
     key = scene.as_pointer()
     record = runtime.records.get(key)
     view = grid_view.views.get(key)
@@ -58,7 +59,7 @@ def draw_simulation(layout, context):
     elif props.error:
         layout.label(text="Simulation error — see Diagnostics", icon="ERROR")
     elif not props.cache_frames:
-        layout.label(text="Ready to simulate" if objects else "Add a source to begin", icon="INFO")
+        layout.label(text="Ready to simulate" if objects or lfm else "Add a source to begin", icon="INFO")
     else:
         layout.label(text="Timeline simulation enabled" if props.enabled else "Cache playback only", icon="PLAY" if props.enabled else "PAUSE")
     draw_hint(layout, context, f"Timeline: {scene.frame_current} | Computed through: {frontier if props.cache_frames else '—'}")
@@ -66,7 +67,7 @@ def draw_simulation(layout, context):
         draw_hint(layout, context, f"Viewing cache frame {stats['frame']} | {stats['time']:.3f} s")
     elif props.cache_frames and not props.stale:
         layout.label(text="No cached result at the current frame")
-    if not active_sources:
+    if not active_sources and not lfm:
         layout.label(text="No source active at this frame", icon="INFO")
     if needs_save:
         draw_hint(layout, context, "Save the .blend or choose an absolute cache folder")
@@ -81,15 +82,17 @@ def draw_simulation(layout, context):
     header, body = layout.panel("pyro_objects", default_closed=False)
     header.label(text="Scene Objects")
     if body:
-        body.label(text=f"Sources: {sources} | Colliders: {colliders}")
+        body.label(text=f"Static colliders: {colliders}" if lfm else f"Sources: {sources} | Colliders: {colliders}")
         row = body.row(align=True)
         row.operator_context = "INVOKE_DEFAULT"
-        row.operator("pyro.add_object", text="New Source", icon="ADD").role = "EMITTER"
+        if not lfm:
+            row.operator("pyro.add_object", text="New Source", icon="ADD").role = "EMITTER"
         row.operator("pyro.add_object", text="New Collider", icon="ADD").role = "COLLIDER"
         body.label(text="New meshes are placed at the 3D cursor")
         row = body.row(align=True)
         row.enabled = context.mode == "OBJECT" and any(obj.type == "MESH" for obj in context.selected_objects)
-        row.operator("pyro.set_role", text="Selected → Source").role = "EMITTER"
+        if not lfm:
+            row.operator("pyro.set_role", text="Selected → Source").role = "EMITTER"
         row.operator("pyro.set_role", text="Selected → Collider").role = "COLLIDER"
         row = body.row()
         row.enabled = context.mode == "OBJECT" and any(obj.type == "MESH" and obj.pyro.role != "NONE" for obj in context.selected_objects)
@@ -99,20 +102,20 @@ def draw_simulation(layout, context):
             body.label(text="Click a name to select; X removes its role")
         else:
             body.label(text="Create a mesh, or assign an existing mesh")
-        draw_hint(body, context, "All sources and colliders share this scene's solver")
+        draw_hint(body, context, "LFM uses constant boundary inflow and static colliders" if lfm else "All sources and colliders share this scene's solver")
 
     header, body = layout.panel("pyro_solver", default_closed=False)
     header.label(text="Solver & Domain")
     if body:
         body.prop(props, "algorithm")
         body.prop(props, "cell_size", text="Finest Voxel Size" if props.algorithm == "SPARSE" else "Voxel Size")
-        if props.algorithm == "DENSE":
+        if props.algorithm != "SPARSE":
             body.prop(props, "dense_origin")
             body.prop(props, "dense_resolution")
             nx, ny, nz = props.dense_resolution
             draw_hint(body, context, f"Size: {nx*props.cell_size:.4g} × {ny*props.cell_size:.4g} × {nz*props.cell_size:.4g} BU")
             body.label(text=f"Domain cells: {nx*ny*nz:,}")
-            body.label(text="Fixed world-aligned domain; open boundaries")
+            body.label(text="Fixed domain; prescribed inflow/outflow" if lfm else "Fixed world-aligned domain; open boundaries")
         elif props.algorithm == "SPARSE":
             body.prop(props, "initial_blocks")
             draw_hint(body, context, "Leaf storage grows automatically as needed")
@@ -130,18 +133,24 @@ def draw_simulation(layout, context):
         body.prop(scene.render, "fps")
         body.prop(scene.render, "fps_base")
         draw_hint(body, context, f"Frame duration: {scene.render.fps_base/scene.render.fps:.6g} s")
-        body.prop(props, "cfl")
-        body.prop(props, "max_time_step")
-        body.prop(props, "animation_tolerance")
-        body.label(text="Start frame is the initial, empty state")
+        if lfm:
+            body.prop(props, "lfm_cycle_steps")
+            draw_hint(body, context, f"One complete cycle per frame; step = {scene.render.fps_base/scene.render.fps/props.lfm_cycle_steps:.6g} s")
+        else:
+            body.prop(props, "cfl")
+            body.prop(props, "max_time_step")
+            body.prop(props, "animation_tolerance")
+        body.label(text="Start frame is the initialized flow" if lfm else "Start frame is the initial, empty state")
         draw_hint(body, context, "Future frames compute synchronously, including skipped frames")
         draw_hint(body, context, "Earlier frames display their cache; playback end sets the loop range")
 
     header, body = layout.panel("pyro_forces", default_closed=True)
-    header.label(text="Forces & Dissipation")
+    header.label(text="Wind Tunnel Inflow" if lfm else "Forces & Dissipation")
     if body:
-        for name in ("buoyancy", "smoke_weight", "up", "wind", "cooling", "dissipation"):
+        for name in (("wind",) if lfm else ("buoyancy", "smoke_weight", "up", "wind", "cooling", "dissipation")):
             body.prop(props, name)
+        if lfm:
+            draw_hint(body, context, "World-space velocity prescribed on opposite domain faces; no buoyancy or smoke emission")
 
     header, body = layout.panel("pyro_pressure", default_closed=True)
     header.label(text="Pressure Solve")
@@ -151,7 +160,7 @@ def draw_simulation(layout, context):
         if props.algorithm == "SPARSE":
             body.prop(props, "amr_padding")
 
-    if props.algorithm != "DENSE":
+    if props.algorithm == "SPARSE":
         header, body = layout.panel("pyro_adaptation", default_closed=True)
         header.label(text="AMR Refinement & Activation")
         if body:
@@ -163,7 +172,7 @@ def draw_simulation(layout, context):
             body.prop(props, "keep_alive_adaptations")
 
     header, body = layout.panel("pyro_output", default_closed=True)
-    header.label(text="Smoke Output & Material")
+    header.label(text="Vorticity Output & Material" if lfm else "Smoke Output & Material")
     if body:
         body.prop(props, "volume", text="Output Volume")
         volume = props.volume
@@ -179,15 +188,17 @@ def draw_simulation(layout, context):
             output = next((node for node in material.node_tree.nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output), None) if material else None
             shader = output.inputs["Volume"].links[0].from_node if output and output.inputs["Volume"].is_linked else None
             if shader and shader.type == "PRINCIPLED_VOLUME":
-                for name, label in (("Density", "Density Scale"), ("Color", "Smoke Color"), ("Anisotropy", "Anisotropy")):
+                for name, label in (("Density", "Display Scale"), ("Color", "Volume Color"), ("Anisotropy", "Anisotropy")):
                     row = body.row()
                     row.enabled = not shader.inputs[name].is_linked
                     row.prop(shader.inputs[name], "default_value", text=label)
             elif material:
                 draw_hint(body, context, "Edit the custom volume material in the Shader Editor")
             else:
-                body.operator("pyro.create_volume", text="Create Smoke Material", icon="MATERIAL")
-            draw_hint(body, context, "VDB density is in world space; keep the output transform at identity")
+                body.operator("pyro.create_volume", text="Create Volume Material", icon="MATERIAL")
+            draw_hint(body, context, "VDB field is in world space; keep the output transform at identity")
+        if lfm:
+            draw_hint(body, context, "Vorticity measures local rotation of the flow. Display scale affects appearance only")
         draw_hint(body, context, "Material changes do not require a simulation reset")
 
     header, body = layout.panel("pyro_cache", default_closed=True)
@@ -235,7 +246,10 @@ def draw_simulation(layout, context):
             if stats["algorithm"] == "SPARSE":
                 draw_hint(body, context, f"Leaves: {stats['blocks']:,} | Allocated capacity: {stats['capacity']:,}")
             draw_hint(body, context, f"Solver GPU allocation: {stats['bytes']/1048576:.1f} MiB")
-            draw_hint(body, context, f"Smoke integral: {stats['smoke_integral']:.6g}")
+            if stats["algorithm"] == "LFM":
+                draw_hint(body, context, f"Max vorticity: {stats['vorticity_max']:.6g} /s")
+            else:
+                draw_hint(body, context, f"Smoke integral: {stats['smoke_integral']:.6g}")
             draw_hint(body, context, "Timings belong to the displayed cached frame")
         elif props.stale:
             draw_hint(body, context, "Cached diagnostics are outdated; reset to recompute")
@@ -251,11 +265,14 @@ def draw_object(layout, context):
         draw_hint(layout, context, "Select a mesh to configure a source or collider")
         return
     props = obj.pyro
+    lfm = context.scene.pyro.algorithm == "LFM"
     layout.prop(obj, "name", text="Object")
     layout.prop(props, "role")
     if props.role == "NONE":
         row = layout.row(align=True)
         for role, label in (("EMITTER", "Make Source"), ("COLLIDER", "Make Collider")):
+            if lfm and role == "EMITTER":
+                continue
             action = row.operator("pyro.set_role", text=label)
             action.object_name, action.role = obj.name, role
         return
@@ -263,6 +280,9 @@ def draw_object(layout, context):
     if context.scene.pyro.stale:
         layout.label(text="Inputs changed — reset required", icon="ERROR")
     if props.role == "EMITTER":
+        if lfm:
+            layout.label(text="LFM uses boundary inflow; remove the Source role", icon="ERROR")
+            return
         header, body = layout.panel("pyro_emission", default_closed=False)
         header.label(text="Emission")
         if body:
@@ -285,14 +305,14 @@ def draw_object(layout, context):
         body.prop(obj, rotation, text="Rotation")
         body.prop(obj, "scale")
         body.prop(obj, "dimensions")
-        draw_hint(body, context, "Transforms, source rates and Active can be keyframed")
+        draw_hint(body, context, "LFM requires static colliders; reset after edits" if lfm else "Transforms, source rates and Active can be keyframed")
     header, body = layout.panel("pyro_object_geometry", default_closed=True)
     header.label(text="Geometry & Display")
     if body:
         body.prop(obj, "data", text="Mesh")
         draw_hint(body, context, f"Base mesh: {len(obj.data.vertices):,} vertices / {len(obj.data.polygons):,} faces")
         draw_hint(body, context, "Use a closed mesh with outward-facing normals")
-        draw_hint(body, context, "Static modifiers and transform animation are supported")
+        draw_hint(body, context, "Static modifiers are supported" if lfm else "Static modifiers and transform animation are supported")
         body.label(text="Deforming meshes are not supported")
         body.prop(obj, "display_type")
         body.prop(obj, "hide_render", text="Hide Mesh in Renders")
@@ -366,7 +386,7 @@ class PYRO_PT_grid(bpy.types.Panel):
             layout.prop(context.space_data.overlay, "show_overlays", text="Viewport Overlays")
         if props.algorithm == "SPARSE":
             layout.prop(props, "grid_level")
-        if props.algorithm != "DENSE":
+        if props.algorithm == "SPARSE":
             layout.prop(props, "grid_color")
             if props.grid_color == "CHANGES":
                 layout.prop(props, "grid_removed")
@@ -379,7 +399,7 @@ class PYRO_PT_grid(bpy.types.Panel):
         layout.prop(props, "grid_xray")
         layout.prop(props, "grid_opacity")
         view = grid_view.views.get(context.scene.as_pointer())
-        if props.algorithm == "DENSE":
+        if props.algorithm != "SPARSE":
             nx, ny, nz = props.dense_resolution
             layout.label(text=f"Configured domain: {nx} × {ny} × {nz}")
             draw_hint(layout, context, f"Cells: {nx*ny*nz:,} | Voxel: {props.cell_size:.4g} BU")

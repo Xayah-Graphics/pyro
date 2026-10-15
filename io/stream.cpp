@@ -9,6 +9,7 @@ module pyro.stream;
 import std;
 import pyro.sparse;
 import pyro.dense;
+import pyro.lfm;
 
 namespace pyro {
     void run_stream() {
@@ -20,6 +21,7 @@ namespace pyro {
         std::cout.exceptions(std::ios::badbit | std::ios::failbit);
         static_assert(sizeof(sparse::Config) == 116);
         static_assert(sizeof(dense::Config) == 88);
+        static_assert(sizeof(lfm::Config) == 56);
         static_assert(sizeof(Motion) == 128);
         static_assert(sizeof(Triangle) == 36);
         auto read  = []<typename T>(T& value) { std::cin.read(reinterpret_cast<char*>(&value), sizeof(T)); };
@@ -37,6 +39,18 @@ namespace pyro {
             }
             std::vector<Source> sources;
             std::vector<Collider> colliders;
+            if constexpr (std::same_as<Solver, lfm::Solver>) {
+                int count;
+                read(count);
+                colliders.resize(count);
+                for (auto& collider : colliders) {
+                    read(collider.mesh);
+                    collider.shape = Shape::mesh;
+                    read(collider.motion);
+                    read(collider.surfaceOffset);
+                }
+                solver.set_colliders(colliders);
+            }
             float frameMilliseconds = 0;
             int frameSubsteps = 0, frameIterations = 0;
             write('K');
@@ -48,28 +62,30 @@ namespace pyro {
                     double endTime;
                     int sourceCount, colliderCount;
                     read(endTime);
-                    read(sourceCount);
-                    read(colliderCount);
-                    sources.resize(sourceCount);
-                    colliders.resize(colliderCount);
-                    for (auto& source : sources) {
-                        read(source.mesh);
-                        source.shape = Shape::mesh;
-                        read(source.motion);
-                        read(source.smokeRate);
-                        read(source.temperatureRate);
-                        read(source.velocityRate);
-                        read(source.velocity);
-                        read(source.inheritVelocity);
+                    if constexpr (!std::same_as<Solver, lfm::Solver>) {
+                        read(sourceCount);
+                        read(colliderCount);
+                        sources.resize(sourceCount);
+                        colliders.resize(colliderCount);
+                        for (auto& source : sources) {
+                            read(source.mesh);
+                            source.shape = Shape::mesh;
+                            read(source.motion);
+                            read(source.smokeRate);
+                            read(source.temperatureRate);
+                            read(source.velocityRate);
+                            read(source.velocity);
+                            read(source.inheritVelocity);
+                        }
+                        for (auto& collider : colliders) {
+                            read(collider.mesh);
+                            collider.shape = Shape::mesh;
+                            read(collider.motion);
+                            read(collider.surfaceOffset);
+                        }
+                        solver.set_sources(sources.data(), sourceCount);
+                        solver.set_colliders(colliders.data(), colliderCount);
                     }
-                    for (auto& collider : colliders) {
-                        read(collider.mesh);
-                        collider.shape = Shape::mesh;
-                        read(collider.motion);
-                        read(collider.surfaceOffset);
-                    }
-                    solver.set_sources(sources.data(), sourceCount);
-                    solver.set_colliders(colliders.data(), colliderCount);
                     solver.advance(endTime - solver.time);
                     frameMilliseconds += solver.statistics.stepMilliseconds;
                     frameSubsteps += solver.statistics.substeps;
@@ -81,8 +97,11 @@ namespace pyro {
                     read(frame);
                     read(snapshot);
                     if (snapshot) {
-                        auto begin               = std::chrono::steady_clock::now();
-                        auto density             = solver.download_density();
+                        auto begin   = std::chrono::steady_clock::now();
+                        auto density = [&] {
+                            if constexpr (std::same_as<Solver, lfm::Solver>) return solver.download_vorticity();
+                            else return solver.download_density();
+                        }();
                         float exportMilliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
                         int blocks = 0, capacity = 0, levels = 1;
                         std::array<float, 3> origin{};
@@ -111,7 +130,8 @@ namespace pyro {
                         write(stats.maxSpeed);
                         write(frameSubsteps);
                         write(frameIterations);
-                        write(stats.smokeIntegral);
+                        if constexpr (std::same_as<Solver, lfm::Solver>) write(0.0);
+                        else write(stats.smokeIntegral);
                         write(capacity);
                         write(origin);
                         write(resolution);
@@ -134,7 +154,7 @@ namespace pyro {
         };
         std::array<char, 8> protocol;
         read(protocol);
-        if (protocol != std::array{'P', 'Y', 'R', 'O', 'S', 'T', 'R', '2'}) throw std::runtime_error("Unsupported solver stream format");
+        if (protocol != std::array{'P', 'Y', 'R', 'O', 'S', 'T', 'R', '3'}) throw std::runtime_error("Unsupported solver stream format");
         char algorithm;
         read(algorithm);
         if (algorithm == 'S') {
@@ -145,6 +165,10 @@ namespace pyro {
             dense::Config config;
             read(config);
             run.operator()<dense::Solver>(config);
+        } else if (algorithm == 'L') {
+            lfm::Config config;
+            read(config);
+            run.operator()<lfm::Solver>(config);
         } else {
             throw std::runtime_error("Unknown solver algorithm");
         }

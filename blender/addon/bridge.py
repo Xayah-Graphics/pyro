@@ -40,11 +40,23 @@ def start(scene, objects, geometry, corners, dynamic, directory):
         for name, kind in config:
             value = getattr(scene.pyro, name)
             values.extend(value if kind in {"3f", "3i"} else [value])
-        solver.stdin.write(b"PYROSTR2" + {"SPARSE": b"S", "DENSE": b"D"}[session["algorithm"]])
+        solver.stdin.write(b"PYROSTR3" + {"SPARSE": b"S", "DENSE": b"D", "LFM": b"L"}[session["algorithm"]])
         solver.stdin.write(struct.pack("<" + "".join(kind for _, kind in config), *values))
         solver.stdin.write(struct.pack("<i", len(objects)))
         for triangles in geometry:
             solver.stdin.write(struct.pack("<i", len(triangles)) + triangles.tobytes())
+        if session["algorithm"] == "LFM":
+            samples = inputs.sample(scene, objects, scene.frame_start)
+            colliders = []
+            for i, (_, active, values) in enumerate(samples):
+                if not active:
+                    continue
+                matrix = samples[i][0]
+                points = matrix @ corners[i]
+                surface = values[0]
+                colliders.append(struct.pack("<i33f", i, *matrix.flat, *([0.0]*12), 0, 0,
+                                             *(points.min(axis=1)-abs(surface)), *(points.max(axis=1)+abs(surface)), surface))
+            solver.stdin.write(struct.pack("<i", len(colliders)) + b"".join(colliders))
         acknowledge(session)
     except Exception:
         close(session)
@@ -54,6 +66,11 @@ def start(scene, objects, geometry, corners, dynamic, directory):
 
 def advance(scene, session):
     current, start, fps = session["current"], session["start"], session["fps"]
+    if session["algorithm"] == "LFM":
+        session["solver"].stdin.write(b"A" + struct.pack("<d", (current+1-start)/fps))
+        acknowledge(session)
+        session["current"] = current + 1
+        return
     samples = session["samples"]
     segments = [(float(current), float(current + 1))]
     while segments:
@@ -103,7 +120,7 @@ def export(session, write_volume):
     frame, count, seconds, spacing, step_ms, export_ms, blocks, cells, divergence, allocated, speed, substeps, iterations, smoke, capacity, ox, oy, oz, nx, ny, nz, levels = HEADER.unpack(packed)
     algorithm = session["algorithm"]
     topology = np.zeros(blocks, dtype=GRID_BLOCK)
-    if algorithm == "DENSE":
+    if algorithm != "SPARSE":
         density = np.frombuffer(solver.stdout.read(count * 4), dtype="<f4", count=count)
     else:
         records = np.frombuffer(solver.stdout.read(count * SPARSE_BLOCK.itemsize), dtype=SPARSE_BLOCK, count=count)
@@ -111,10 +128,11 @@ def export(session, write_volume):
             topology[name] = records[name]
     begin = time.perf_counter()
     grid = openvdb.FloatGrid()
-    grid.name = "density"
+    field = "vorticity" if algorithm == "LFM" else "density"
+    grid.name = field
     grid.gridClass = openvdb.GridClass.FOG_VOLUME
     grid.transform = openvdb.createLinearTransform([[spacing, 0, 0, 0], [0, spacing, 0, 0], [0, 0, spacing, 0], [ox+spacing/2, oy+spacing/2, oz+spacing/2, 1]])
-    if algorithm == "DENSE":
+    if algorithm != "SPARSE":
         grid.copyFromArray(np.ascontiguousarray(density.reshape(nz, ny, nx).transpose(2, 1, 0)))
     else:
         for record in records:
@@ -135,11 +153,14 @@ def export(session, write_volume):
                     lower = origin + np.array((local % 8, local // 8 % 8, local // 64)) * scale
                     grid.fill(tuple(lower), tuple(lower + scale - 1), float(values[local]))
     grid.prune()
-    destination = session["directory"] / f"density_{frame-session['start']+1:06d}.vdb"
+    destination = session["directory"] / f"volume_{frame-session['start']+1:06d}.vdb"
     temporary = destination.with_suffix(".tmp.vdb")
     openvdb.write(str(temporary), grids=[grid], metadata={"simulation_time": seconds, "solver_algorithm": algorithm})
     temporary.replace(destination)
     stats = {"algorithm": algorithm, "frame": frame, "time": seconds, "step_ms": step_ms, "export_ms": export_ms, "convert_ms": (time.perf_counter()-begin)*1000, "blocks": blocks, "cells": cells, "divergence": divergence, "bytes": allocated, "max_speed": speed, "substeps": substeps, "pressure_iterations": iterations, "smoke_integral": smoke, "spacing": spacing, "origin": [ox, oy, oz], "resolution": [nx, ny, nz], "capacity": capacity, "levels": levels, "level_blocks": np.bincount(topology["level"], minlength=levels).tolist()}
+    if algorithm == "LFM":
+        del stats["smoke_integral"]
+        stats["vorticity_max"] = float(density.max())
     destination = session["directory"] / f"grid_{frame-session['start']+1:06d}.npz"
     temporary = destination.with_suffix(".tmp")
     with temporary.open("wb") as output:

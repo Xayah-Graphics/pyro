@@ -11,6 +11,9 @@ COMMON_CONFIG = (
     ("pressure_max_iterations", "i"),
 )
 CONFIG = {
+    "LFM": (("cell_size", "f"), ("dense_origin", "3f"), ("dense_resolution", "3i"),
+            ("wind", "3f"), ("lfm_cycle_steps", "i"), ("pressure_relative_tolerance", "f"),
+            ("divergence_tolerance", "f"), ("pressure_max_iterations", "i")),
     "DENSE": (("cell_size", "f"), ("dense_origin", "3f"), ("dense_resolution", "3i")) + COMMON_CONFIG,
     "SPARSE": (("cell_size", "f"), ("initial_blocks", "i"), ("amr_levels", "i"), ("amr_padding", "i"),
             ("amr_adapt_interval", "i"), ("amr_coarsen_delay", "i"), ("keep_alive_adaptations", "i"),
@@ -71,7 +74,8 @@ def output_changed(self, context):
 
 class PYRO_PG_scene(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(name="Timeline Simulation", description="Compute missing frames when the timeline advances; disable to play only cached frames and release the solver process", default=False, options=set(), update=enable_timeline)
-    algorithm: bpy.props.EnumProperty(name="Algorithm", items=[("SPARSE", "Sparse (AMR)", "Dynamic sparse domain with adaptive-resolution leaf blocks"), ("DENSE", "Dense", "Fixed axis-aligned grid with open boundaries")], default="SPARSE", options=set(), update=input_changed)
+    algorithm: bpy.props.EnumProperty(name="Algorithm", items=[("SPARSE", "Sparse (AMR)", "Dynamic sparse domain with adaptive-resolution leaf blocks"), ("DENSE", "Dense", "Fixed axis-aligned grid with open boundaries"), ("LFM", "Leapfrog Flow Maps", "Fixed wind tunnel, static colliders and vorticity output")], default="SPARSE", options=set(), update=input_changed)
+    lfm_cycle_steps: bpy.props.IntProperty(name="Steps per Cycle", description="Equal substeps within one complete reinitialization cycle per timeline frame", default=5, min=2, options=set(), update=input_changed)
     cell_size: bpy.props.FloatProperty(name="Voxel Size", description="Cell width in Blender world units; the finest level for AMR. Smaller cells increase detail and simulation cost", default=0.025, min=0.0001, subtype="DISTANCE", options=set(), update=input_changed)
     dense_origin: bpy.props.FloatVectorProperty(name="Domain Minimum", description="World-space minimum corner of the fixed dense domain", default=(-1.6, -1.6, -0.4), subtype="TRANSLATION", options=set(), update=input_changed)
     dense_resolution: bpy.props.IntVectorProperty(name="Resolution", description="Voxel counts along world X, Y and Z; domain size is resolution times voxel size", default=(128, 128, 192), min=1, options=set(), update=input_changed)
@@ -102,7 +106,7 @@ class PYRO_PG_scene(bpy.types.PropertyGroup):
     animation_tolerance: bpy.props.FloatProperty(name="Motion Error (voxels)", description="Maximum transform interpolation error in finest-voxel units; reduces the sampling interval for curved motion", default=0.05, min=0.001, max=0.5, options=set(), update=input_changed)
     checkpoint_interval: bpy.props.IntProperty(name="Checkpoint Interval", description="Save a resumable solver checkpoint every N simulated frames; also saved with the .blend and when releasing the solver", default=24, min=1, options=set())
     cache_root: bpy.props.StringProperty(name="Cache Folder", description="Parent folder for new simulation caches; // is relative to a saved .blend", subtype="DIR_PATH", default="//pyro_cache/", options=set())
-    volume: bpy.props.PointerProperty(name="Output Volume", description="Volume object receiving the world-space density cache; keep its transform at identity", type=bpy.types.Object, poll=volume_object, update=output_changed)
+    volume: bpy.props.PointerProperty(name="Output Volume", description="Volume object receiving the world-space scalar field; keep its transform at identity", type=bpy.types.Object, poll=volume_object, update=output_changed)
     object_list_index: bpy.props.IntProperty(default=0, min=0, options={"SKIP_SAVE"})
     grid_show: bpy.props.BoolProperty(name="Show Solver Grid", default=False, options=set(), update=grid_view.refresh)
     grid_color: bpy.props.EnumProperty(name="Color", items=[("LEVEL", "Resolution Level", "L0 is finest; each level doubles voxel size"), ("CHANGES", "Frame Changes", "Compare with the previous output frame")], default="LEVEL", options=set(), update=grid_view.refresh)

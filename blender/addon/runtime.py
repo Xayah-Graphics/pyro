@@ -52,22 +52,26 @@ def invalidate(scene):
 def create_volume(scene):
     volume = scene.pyro.volume
     if volume is None:
-        volume = bpy.data.objects.new("Pyro Volume", bpy.data.volumes.new("Pyro Density"))
+        volume = bpy.data.objects.new("Pyro Volume", bpy.data.volumes.new("Pyro Field"))
         scene.collection.objects.link(volume)
         volume.hide_viewport = volume.hide_render = True
         scene.pyro.volume = volume
     if volume.active_material is None:
-        material = bpy.data.materials.new("Pyro Smoke")
+        material = bpy.data.materials.new("Pyro Volume")
         material.node_tree.nodes.clear()
         output = material.node_tree.nodes.new("ShaderNodeOutputMaterial")
         shader = material.node_tree.nodes.new("ShaderNodeVolumePrincipled")
-        shader.inputs["Density"].default_value = 8
-        shader.inputs["Density Attribute"].default_value = "density"
+        shader.inputs["Density"].default_value = 0.15 if scene.pyro.algorithm == "LFM" else 8
         material.node_tree.links.new(shader.outputs["Volume"], output.inputs["Volume"])
         if volume.data.materials:
             volume.active_material = material
         else:
             volume.data.materials.append(material)
+    material = volume.active_material
+    output = next((node for node in material.node_tree.nodes if node.type == "OUTPUT_MATERIAL" and node.is_active_output), None)
+    shader = output.inputs["Volume"].links[0].from_node if output and output.inputs["Volume"].is_linked else None
+    if shader and shader.type == "PRINCIPLED_VOLUME":
+        shader.inputs["Density Attribute"].default_value = "vorticity" if scene.pyro.algorithm == "LFM" else "density"
     return volume
 
 
@@ -77,16 +81,21 @@ def connect(scene):
     geometry, corners, hashes = inputs.geometry(objects, bpy.context.evaluated_depsgraph_get())
     dependencies = inputs.dependencies(objects)
     signature, dynamic = inputs.signature(scene, dependencies, hashes)
+    if props.algorithm == "LFM":
+        if any(obj.pyro.role == "EMITTER" for obj in objects):
+            raise RuntimeError("LFM uses boundary inflow; remove Source roles or choose a smoke solver")
+        if dynamic:
+            raise RuntimeError("LFM requires static collider geometry and transforms")
     if props.cache_directory:
         directory = Path(props.cache_directory)
         manifest = json.loads((directory / "cache.json").read_text(encoding="utf-8"))
-        props.stale = props.stale or manifest.get("format") != 2 or signature != manifest["signature"]
+        props.stale = props.stale or manifest.get("format") != 3 or signature != manifest["signature"]
     else:
         if props.cache_root.startswith("//") and not bpy.data.filepath:
             raise RuntimeError("Save the Blender project before using a relative cache folder")
         directory = Path(bpy.path.abspath(props.cache_root)) / uuid.uuid4().hex
         directory.mkdir(parents=True)
-        manifest = {"format": 2, "generation": directory.name, "algorithm": props.algorithm, "signature": signature, "start": scene.frame_start, "completed": scene.frame_start-1, "checkpoint": scene.frame_start-1}
+        manifest = {"format": 3, "generation": directory.name, "algorithm": props.algorithm, "signature": signature, "start": scene.frame_start, "completed": scene.frame_start-1, "checkpoint": scene.frame_start-1}
         props.cache_directory = str(directory)
     watched = {obj.as_pointer() for obj in dependencies}
     for obj in dependencies:
@@ -116,7 +125,7 @@ def display(scene, record, frame):
     if volume is not None:
         volume.hide_viewport = volume.hide_render = not available
     if available and volume is not None:
-        path = str(record["directory"] / f"density_{frame-manifest['start']+1:06d}.vdb")
+        path = str(record["directory"] / f"volume_{frame-manifest['start']+1:06d}.vdb")
         if volume.data.filepath != path or volume.data.is_sequence:
             volume.data.grids.unload()
             volume.data.is_sequence = False

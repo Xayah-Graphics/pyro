@@ -99,7 +99,7 @@ class PYRO_OT_select_object(bpy.types.Operator):
 class PYRO_OT_volume(bpy.types.Operator):
     bl_idname = "pyro.create_volume"
     bl_label = "Create Output Volume"
-    bl_description = "Create the smoke volume and its density material in this scene"
+    bl_description = "Create the output volume and its scalar-field material in this scene"
     bl_options = {"UNDO"}
 
     def execute(self, context):
@@ -167,7 +167,8 @@ class PYRO_MT_add(bpy.types.Menu):
     bl_label = "Pyro"
 
     def draw(self, context):
-        self.layout.operator("pyro.add_object", text="Smoke Source", icon="MOD_FLUID").role = "EMITTER"
+        if context.scene.pyro.algorithm != "LFM":
+            self.layout.operator("pyro.add_object", text="Smoke Source", icon="MOD_FLUID").role = "EMITTER"
         self.layout.operator("pyro.add_object", text="Collider", icon="MOD_PHYSICS").role = "COLLIDER"
         self.layout.separator()
         self.layout.operator("pyro.create_volume", icon="OUTLINER_DATA_VOLUME")

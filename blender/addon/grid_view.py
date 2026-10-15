@@ -37,7 +37,7 @@ def refresh(self, context):
             view["blocks"] = None
             view["removed"] = view["changes"] = None
             view["batches"] = []
-        elif self.algorithm != "DENSE" and not self.stale and view["blocks"] is None:
+        elif self.algorithm == "SPARSE" and not self.stale and view["blocks"] is None:
             load(self.id_data, Path(view["stamp"][0]), view["stamp"][1], view["start"])
     redraw(self, context)
 
@@ -46,7 +46,7 @@ def load(scene, directory, frame, start):
     key = scene.as_pointer()
     stamp = (str(directory), frame)
     old = views.get(key)
-    want_blocks = scene.pyro.grid_show and scene.pyro.algorithm != "DENSE"
+    want_blocks = scene.pyro.grid_show and scene.pyro.algorithm == "SPARSE"
     if old and old["stamp"] == stamp and (not want_blocks or old["blocks"] is not None):
         return
     with np.load(directory / f"grid_{frame-start+1:06d}.npz") as data:
@@ -168,7 +168,7 @@ def draw():
     key = context.scene.as_pointer()
     if not props.grid_show or not context.space_data.overlay.show_overlays:
         return
-    if props.algorithm == "DENSE":
+    if props.algorithm != "SPARSE":
         stamp = (tuple(props.dense_origin), tuple(props.dense_resolution), props.cell_size, props.grid_slice, props.grid_position, props.grid_opacity)
         view = domains.get(key)
         if view is None or view["stamp"] != stamp:
@@ -221,7 +221,7 @@ class PYRO_OT_grid_pick(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.area is not None and context.area.type == "VIEW_3D" and context.scene.pyro.algorithm != "DENSE" and not context.scene.pyro.stale and context.scene.pyro.grid_show and context.scene.as_pointer() in views and views[context.scene.as_pointer()]["blocks"] is not None
+        return context.area is not None and context.area.type == "VIEW_3D" and context.scene.pyro.algorithm == "SPARSE" and not context.scene.pyro.stale and context.scene.pyro.grid_show and context.scene.as_pointer() in views and views[context.scene.as_pointer()]["blocks"] is not None
 
     def invoke(self, context, event):
         context.window.cursor_modal_set("CROSSHAIR")
