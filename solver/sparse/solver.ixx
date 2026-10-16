@@ -6,18 +6,18 @@ import std;
 
 export namespace pyro::sparse {
     struct Config {
-        float cellSize{0.05f}; // Finest spacing; level l has spacing cellSize * 2^l.
-        int initialBlocks{4096}; // Initial reservation; storage grows with the leaf count.
-        int levels{3}, pressurePadding{1}, adaptInterval{2}, coarsenDelay{4}, keepAlive{4};
-        float smokeAbsoluteError{0.0003125f}, temperatureAbsoluteError{0.00125f}, velocityAbsoluteError{0.001875f}, relativeError{0.003125f};
-        float smokeThreshold{1.e-5f}, temperatureThreshold{1.e-4f}, velocityThreshold{0.025f};
-        float cfl{0.75f}, maxTimeStep{1.f / 48}, buoyancy{1}, smokeWeight{0.05f};
+        float cell_size{0.05f};
+        int initial_blocks{4096};
+        int levels{3}, pressure_padding{1}, adapt_interval{2}, coarsen_delay{4}, keep_alive{4};
+        float smoke_absolute_error{0.0003125f}, temperature_absolute_error{0.00125f}, velocity_absolute_error{0.001875f}, relative_error{0.003125f};
+        float smoke_threshold{1.e-5f}, temperature_threshold{1.e-4f}, velocity_threshold{0.025f};
+        float cfl{0.75f}, max_time_step{1.f / 48}, buoyancy{1}, smoke_weight{0.05f};
         std::array<float, 3> up{0, 1, 0}, wind{};
-        float cooling{0.1f}, dissipation{0.01f}, pressureRelativeTolerance{1.e-5f}, divergenceTolerance{2.e-4f};
-        int pressureMaxIterations{300};
+        float cooling{0.1f}, dissipation{0.01f}, pressure_relative_tolerance{1.e-5f}, divergence_tolerance{2.e-4f};
+        int pressure_max_iterations{300};
     };
     struct GridBlock {
-        std::array<int, 3> coordinate{}; // In blocks at this level, not finest cells.
+        std::array<int, 3> coordinate{};
         int level{}, quiet{}, remaining{};
     };
     struct DensityBlock {
@@ -25,10 +25,10 @@ export namespace pyro::sparse {
         std::array<float, 512> values;
     };
     struct Statistics {
-        int blocks{}, capacity{}, fluidCells{}, substeps{}, pressureIterations{}, pressureLevels{};
-        float maxDivergence{}, maxSpeed{}, stepMilliseconds{}, topologyMilliseconds{}, geometryMilliseconds{}, advectionMilliseconds{}, forcesMilliseconds{}, projectionMilliseconds{}, statisticsMilliseconds{};
-        double smokeIntegral{}, temperatureIntegral{};
-        unsigned long long allocatedBytes{};
+        int blocks{}, capacity{}, fluid_cells{}, substeps{}, pressure_iterations{}, pressure_levels{};
+        float max_divergence{}, max_speed{}, step_milliseconds{}, topology_milliseconds{}, geometry_milliseconds{}, advection_milliseconds{}, forces_milliseconds{}, projection_milliseconds{}, statistics_milliseconds{};
+        double smoke_integral{}, temperature_integral{};
+        unsigned long long allocated_bytes{};
     };
     struct Solver {
         const Config config;
@@ -56,20 +56,20 @@ export namespace pyro::sparse {
         cuda::sparse::PressureWorkspace pressure;
         cuda::Source* sources{};
         cuda::Collider* colliders{};
-        int sourceCount{}, colliderCount{}, sourceCapacity{}, colliderCapacity{}, substep{};
+        int source_count{}, collider_count{}, source_capacity{}, collider_capacity{}, substep{};
         std::vector<cuda::Mesh> meshes;
-        std::vector<Source> sourceInputs;
-        std::vector<Collider> colliderInputs;
-        bool topologyDirty{true}, geometryDirty{true}, movingGeometry{}, matrixDirty{true};
+        std::vector<Source> source_inputs;
+        std::vector<Collider> collider_inputs;
+        bool topology_dirty{true}, geometry_dirty{true}, moving_geometry{}, matrix_dirty{true};
         std::vector<DensityBlock> density;
         std::vector<std::array<cudaEvent_t, 2>> events;
 
         template <typename T>
-        void allocate(T*& pointer, unsigned long long count, unsigned long long zeroFrom = 0);
+        void allocate(T*& pointer, unsigned long long count, unsigned long long zero_from = 0);
         template <typename T>
         void release(T*& pointer, unsigned long long count);
         template <typename T>
-        void resize(T*& pointer, unsigned long long previousCount, unsigned long long count, unsigned long long retained = 0);
+        void resize(T*& pointer, unsigned long long previous_count, unsigned long long count, unsigned long long retained = 0);
         void reserve(int required);
         void build_pressure();
         void project(cuda::sparse::Fields fields);

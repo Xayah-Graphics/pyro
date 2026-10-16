@@ -1,20 +1,19 @@
 #ifndef PYRO_SPARSE_CUDA_CUH
 #define PYRO_SPARSE_CUDA_CUH
 #include "../geometry.cuh"
-#include "../pressure.cuh"
 
 namespace pyro::cuda::sparse {
-    inline constexpr unsigned long long emptyKey = ~0ull;
+    inline constexpr unsigned long long empty_key = ~0ull;
     struct Config {
-        float cellSize{0.05f};
-        int initialBlocks{4096};
-        int levels{3}, pressurePadding{1}, adaptInterval{2}, coarsenDelay{4}, keepAlive{4};
-        float smokeAbsoluteError{0.0003125f}, temperatureAbsoluteError{0.00125f}, velocityAbsoluteError{0.001875f}, relativeError{0.003125f};
-        float smokeThreshold{1.e-5f}, temperatureThreshold{1.e-4f}, velocityThreshold{0.025f};
-        float cfl{0.75f}, maxTimeStep{1.f / 48}, buoyancy{1}, smokeWeight{0.05f};
+        float cell_size{0.05f};
+        int initial_blocks{4096};
+        int levels{3}, pressure_padding{1}, adapt_interval{2}, coarsen_delay{4}, keep_alive{4};
+        float smoke_absolute_error{0.0003125f}, temperature_absolute_error{0.00125f}, velocity_absolute_error{0.001875f}, relative_error{0.003125f};
+        float smoke_threshold{1.e-5f}, temperature_threshold{1.e-4f}, velocity_threshold{0.025f};
+        float cfl{0.75f}, max_time_step{1.f / 48}, buoyancy{1}, smoke_weight{0.05f};
         float3 up{0, 1, 0}, wind{};
-        float cooling{0.1f}, dissipation{0.01f}, pressureRelativeTolerance{1.e-5f}, divergenceTolerance{2.e-4f};
-        int pressureMaxIterations{300};
+        float cooling{0.1f}, dissipation{0.01f}, pressure_relative_tolerance{1.e-5f}, divergence_tolerance{2.e-4f};
+        int pressure_max_iterations{300};
     };
     struct Node {
         int3 coordinate{};
@@ -38,12 +37,12 @@ namespace pyro::cuda::sparse {
         Block* blocks{};
         unsigned long long* keys{};
         int* indices{};
-        int count{}, capacity{}, tableSize{}, levels{};
+        int count{}, capacity{}, table_size{}, levels{};
         float h{};
     };
     struct Face {
         int left{-1}, right{-1}, group{-1};
-        float area{}, solidFlux{}, weight{}, distance{};
+        float area{}, solid_flux{}, weight{}, distance{};
     };
     struct Links {
         int face[4]{-1, -1, -1, -1};
@@ -53,21 +52,21 @@ namespace pyro::cuda::sparse {
         Face* faces{};
         Links* links{};
         unsigned char* fluid{};
-        float* solidDivergence{};
+        float* solid_divergence{};
         Fields state, midpoint, next, transported;
-        float* samples[3]{}; // Native 11^3 ghost tiles for original, carrier and reverse transport.
-        unsigned char* uniformSamples{};
-        float* distance[3]{}; // Exact native 9^3 corner samples at t, t+dt/2 and t+dt.
-        float geometryTime{}, geometryDuration{}, colliderSpeed{};
-        bool staticGeometry{true};
+        float* samples[3]{};
+        unsigned char* uniform_samples{};
+        float* distance[3]{};
+        float geometry_time{}, geometry_duration{}, collider_speed{};
+        bool static_geometry{true};
     };
     struct Scratch {
         unsigned long long* keys[3]{};
         float* values[2]{};
         int* count{};
         int capacity{};
-        void* sortStorage{};
-        unsigned long long sortBytes{};
+        void* sort_storage{};
+        unsigned long long sort_bytes{};
     };
     struct Topology {
         unsigned long long* roots{};
@@ -78,7 +77,7 @@ namespace pyro::cuda::sparse {
         int* split{};
         Block* candidates{};
         int* counters{};
-        int tableSize{}, capacity{};
+        int table_size{}, capacity{};
     };
     struct Edge {
         int left{}, right{};
@@ -89,18 +88,24 @@ namespace pyro::cuda::sparse {
         int* parent{};
         int* children{};
         Edge* edges{};
-        float* faceWeights{}; // Contiguous finest-level coefficients for structured block interiors.
-        int* adjacency{}; // Coarse levels only, at most 24 neighbors on a balanced octree.
+        float* face_weights{};
+        int* adjacency{};
         float* boundary{};
         float* diagonal{};
         float* rhs{};
         float* solution{};
         float* temporary{};
-        int count{}, edgeCount{}, capacity{}, edgeCapacity{};
+        int count{}, edge_count{}, capacity{}, edge_capacity{};
     };
+    struct IterationState {
+        double rz{}, previous_rz{}, denominator{}, initial_norm{};
+        float max_residual{};
+        int iterations{}, converged{}, failed{};
+    };
+
     struct PressureWorkspace {
         PressureLevel* levels{};
-        int levelCount{};
+        int level_count{};
         double* solution{};
         float* residual{};
         float* direction{};
@@ -109,23 +114,21 @@ namespace pyro::cuda::sparse {
         int* open{};
         unsigned char* anchors{};
         double* reductions{};
-        double* componentSums{};
+        double* component_sums{};
         bool closed{};
         IterationState* iteration{};
         cudaGraphExec_t graph{};
     };
     void initialize_scratch(Scratch& scratch, int capacity, cudaStream_t stream);
     void rebuild_hash(Layout layout, cudaStream_t stream);
-    // On overflow, return a required capacity larger than newGrid.layout.capacity.
-    // The live oldGrid is unchanged, so the caller can reserve and repeat adaptation.
-    int adapt(Grid oldGrid, Grid newGrid, Topology topology, Scratch scratch, Config config, const Source* sources, int sourceCount, const Collider* colliders, int colliderCount, float time, float horizon, bool& changed, cudaStream_t stream);
+    int adapt(Grid old_grid, Grid new_grid, Topology topology, Scratch scratch, Config config, const Source* sources, int source_count, const Collider* colliders, int collider_count, float time, float horizon, bool& changed, cudaStream_t stream);
     void build_connectivity(Grid grid, cudaStream_t stream);
-    void sample_geometry(Grid grid, Layout previous, const float* previousDistance, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
+    void sample_geometry(Grid grid, Layout previous, const float* previous_distance, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
     void geometry(Grid grid, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
-    void remap(Grid oldGrid, Grid newGrid, Config config, cudaStream_t stream);
+    void remap(Grid old_grid, Grid new_grid, Config config, cudaStream_t stream);
     void advect(Grid grid, Fields destination, Fields carrier, Config config, bool obstacles, float time, float dt, cudaStream_t stream);
     void forces(Grid grid, Fields destination, Fields carrier, Config config, const Source* sources, int count, float time, float dt, cudaStream_t stream);
-    void measure(Grid grid, Config config, const Source* sources, int sourceCount, float time, bool full, double* reductions, cudaStream_t stream);
+    void measure(Grid grid, Config config, const Source* sources, int source_count, float time, bool full, double* reductions, cudaStream_t stream);
     bool fine_matrix(Grid grid, PressureWorkspace workspace, bool obstacles, cudaStream_t stream);
     int coarse_nodes(PressureLevel fine, PressureLevel coarse, Scratch scratch, int depth, cudaStream_t stream);
     int coarse_edges(PressureLevel fine, PressureLevel coarse, Scratch scratch, cudaStream_t stream);
@@ -154,8 +157,8 @@ namespace pyro::cuda::sparse {
     __device__ inline int insert(unsigned long long* keys, int size, unsigned long long k) {
         int slot = hash(k, size);
         for (int n = 0; n < size; ++n) {
-            auto previous = atomicCAS(keys + slot, emptyKey, k);
-            if (previous == emptyKey || previous == k) return slot;
+            auto previous = atomicCAS(keys + slot, empty_key, k);
+            if (previous == empty_key || previous == k) return slot;
             slot = (slot + 1) & (size - 1);
         }
         return -1;
@@ -164,13 +167,13 @@ namespace pyro::cuda::sparse {
         int slot = hash(k, size);
         for (int n = 0; n < size; ++n) {
             if (keys[slot] == k) return slot;
-            if (keys[slot] == emptyKey) return -1;
+            if (keys[slot] == empty_key) return -1;
             slot = (slot + 1) & (size - 1);
         }
         return -1;
     }
     __device__ inline int find_block(Layout layout, int3 p, int level) {
-        int slot = lookup(layout.keys, layout.tableSize, key(p, level));
+        int slot = lookup(layout.keys, layout.table_size, key(p, level));
         return slot < 0 ? -1 : layout.indices[slot];
     }
     __device__ inline int locate(Layout layout, int3 fine) {
@@ -225,18 +228,16 @@ namespace pyro::cuda::sparse {
         if (axis == 1) p.y += sign * .5f * h;
         if (axis == 2) p.z += sign * .5f * h;
     }
-    __device__ inline float3 axis_vector(int axis, float amount) {
-        return {axis == 0 ? amount : 0, axis == 1 ? amount : 0, axis == 2 ? amount : 0};
-    }
     __device__ inline float sample_boundary(Grid grid, float3 p, float time) {
         int i = locate(grid.layout, p);
         if (i < 0) return 4 * grid.layout.h;
-        int block   = i >> 9;
-        int3 origin = grid.layout.blocks[block].coordinate;
-        float3 q    = p / spacing(grid.layout, i) - float3{float(origin.x * 8), float(origin.y * 8), float(origin.z * 8)};
+        int block       = i >> 9;
+        int3 origin     = grid.layout.blocks[block].coordinate;
+        float inverse_h = 1.0f / spacing(grid.layout, i);
+        float3 q{p.x * inverse_h - float(origin.x * 8), p.y * inverse_h - float(origin.y * 8), p.z * inverse_h - float(origin.z * 8)};
         int3 base{min(7, max(0, int(floorf(q.x)))), min(7, max(0, int(floorf(q.y)))), min(7, max(0, int(floorf(q.z))))};
         float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
-        float fraction = grid.staticGeometry ? 0 : fminf(2, fmaxf(0, 2 * (time - grid.geometryTime) / grid.geometryDuration));
+        float fraction = grid.static_geometry ? 0 : fminf(2, fmaxf(0, 2 * (time - grid.geometry_time) / grid.geometry_duration));
         int lower      = fraction < 1 ? 0 : 1;
         float blend = fraction - lower, sum = 0;
         for (int z = 0; z < 2; ++z)
@@ -244,7 +245,7 @@ namespace pyro::cuda::sparse {
                 for (int x = 0; x < 2; ++x) {
                     int index   = block * 729 + base.x + x + 9 * (base.y + y) + 81 * (base.z + z);
                     float value = grid.distance[lower][index];
-                    if (!grid.staticGeometry) value += (grid.distance[lower + 1][index] - value) * blend;
+                    if (!grid.static_geometry) value += (grid.distance[lower + 1][index] - value) * blend;
                     sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
                 }
         return sum;
@@ -254,8 +255,8 @@ namespace pyro::cuda::sparse {
         float sum   = 0;
         for (int f : links.face)
             if (f >= 0) {
-                float faceH = ldexpf(grid.layout.h, grid.layout.blocks[f / 1728].level);
-                sum += total ? grid.faces[f].area * fields.velocity[f] + grid.faces[f].solidFlux : fields.velocity[f] * faceH * faceH;
+                float face_h = ldexpf(grid.layout.h, grid.layout.blocks[f / 1728].level);
+                sum += total ? grid.faces[f].area * fields.velocity[f] + grid.faces[f].solid_flux : fields.velocity[f] * face_h * face_h;
             }
         float h = spacing(grid.layout, i);
         return sum / (h * h);
@@ -269,9 +270,16 @@ namespace pyro::cuda::sparse {
         float3 c = center(grid.layout, i);
         float slopes[3], extent = 0;
         for (int a = 0; a < 3; ++a) {
-            int l = locate(grid.layout, c - axis_vector(a, h)), r = locate(grid.layout, c + axis_vector(a, h));
-            float dl  = l >= 0 ? (q - field[l]) / (component(c - center(grid.layout, l), a)) : 0;
-            float dr  = r >= 0 ? (field[r] - q) / (component(center(grid.layout, r) - c, a)) : 0;
+            int l = locate(grid.layout, float3{c.x - (a == 0 ? h : 0), c.y - (a == 1 ? h : 0), c.z - (a == 2 ? h : 0)}), r = locate(grid.layout, float3{c.x + (a == 0 ? h : 0), c.y + (a == 1 ? h : 0), c.z + (a == 2 ? h : 0)});
+            float dl = 0, dr = 0;
+            if (l >= 0) {
+                float3 left = center(grid.layout, l);
+                dl          = (q - field[l]) / (a == 0 ? c.x - left.x : a == 1 ? c.y - left.y : c.z - left.z);
+            }
+            if (r >= 0) {
+                float3 right = center(grid.layout, r);
+                dr           = (field[r] - q) / (a == 0 ? right.x - c.x : a == 1 ? right.y - c.y : right.z - c.z);
+            }
             slopes[a] = minmod(dl, dr);
             extent += fabsf(slopes[a]) * h * .5f;
         }
@@ -280,10 +288,11 @@ namespace pyro::cuda::sparse {
     }
     __device__ inline float face_value(Grid grid, Fields fields, float3 p, int axis, float background) {
         float epsilon = grid.layout.h * .001f;
-        int i = locate(grid.layout, p + axis_vector(axis, epsilon)), left = locate(grid.layout, p - axis_vector(axis, epsilon));
+        int i = locate(grid.layout, float3{p.x + (axis == 0 ? epsilon : 0), p.y + (axis == 1 ? epsilon : 0), p.z + (axis == 2 ? epsilon : 0)}), left = locate(grid.layout, float3{p.x - (axis == 0 ? epsilon : 0), p.y - (axis == 1 ? epsilon : 0), p.z - (axis == 2 ? epsilon : 0)});
         if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
         if (i < 0) return background;
-        float t   = .5f + component(p - center(grid.layout, i), axis) / spacing(grid.layout, i);
+        float3 c  = center(grid.layout, i);
+        float t   = .5f + (axis == 0 ? p.x - c.x : axis == 1 ? p.y - c.y : p.z - c.z) / spacing(grid.layout, i);
         float low = side_velocity(grid, fields, i, axis, -1), high = side_velocity(grid, fields, i, axis, 1);
         return low + (high - low) * t;
     }
@@ -291,33 +300,29 @@ namespace pyro::cuda::sparse {
         int block  = anchor >> 9;
         Block node = grid.layout.blocks[block];
         float h    = spacing(grid.layout, anchor);
-        float3 stagger{.5f, .5f, .5f};
-        if (field < 3) stagger = stagger - axis_vector(field, .5f);
-        float3 q = p / h - stagger;
+        float3 stagger{field == 0 ? 0.0f : .5f, field == 1 ? 0.0f : .5f, field == 2 ? 0.0f : .5f};
+        float inverse_h = 1.0f / h;
+        float3 q{p.x * inverse_h - stagger.x, p.y * inverse_h - stagger.y, p.z * inverse_h - stagger.z};
         int3 base{int(floorf(q.x)), int(floorf(q.y)), int(floorf(q.z))};
         float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
         int first = (block * 5 + field) * 1331 + base.x - node.coordinate.x * 8 + 1 + 11 * (base.y - node.coordinate.y * 8 + 1) + 121 * (base.z - node.coordinate.z * 8 + 1);
         float sum = 0, lo = 1.e30f, hi = -1.e30f;
-        bool sameLevel = true;
+        bool same_level = true;
         for (int z = 0; z < 2; ++z)
             for (int y = 0; y < 2; ++y)
                 for (int x = 0; x < 2; ++x) {
                     int index   = first + x + 11 * y + 121 * z;
                     float value = fields.samples[index];
-                    sameLevel &= grid.uniformSamples[index] != 0;
+                    same_level &= grid.uniform_samples[index] != 0;
                     sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
                     lo = fminf(lo, value);
                     hi = fmaxf(hi, value);
                 }
         if (lower) *lower = lo;
         if (upper) *upper = hi;
-        if (uniform) *uniform = sameLevel;
+        if (uniform) *uniform = same_level;
         return sum;
     }
-    // The common h/2 lattice contains EVERY native cell/face center. Ordinary
-    // native trilinear interpolation is exact away from transitions. At a level
-    // transition its nodal extension provides a continuous interpolant without
-    // storing a dense grid or smoothing the identity map at dt=0.
     __device__ inline float sample(Grid grid, Fields fields, float3 p, int field, float background = 0, float* lower = nullptr, float* upper = nullptr) {
         int anchor = locate(grid.layout, p);
         if (anchor >= 0) {
@@ -325,8 +330,9 @@ namespace pyro::cuda::sparse {
             float value = native_sample(grid, fields, p, field, anchor, lower, upper, &uniform);
             if (uniform) return value;
         }
-        float h  = .5f * grid.layout.h;
-        float3 q = p / h;
+        float h         = .5f * grid.layout.h;
+        float inverse_h = 1.0f / h;
+        float3 q{p.x * inverse_h, p.y * inverse_h, p.z * inverse_h};
         int3 base{int(floorf(q.x)), int(floorf(q.y)), int(floorf(q.z))};
         float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
         float sum = 0, lo = 1.e30f, hi = -1.e30f;
@@ -336,11 +342,12 @@ namespace pyro::cuda::sparse {
                     float3 point{(base.x + x) * h, (base.y + y) * h, (base.z + z) * h};
                     int i = locate(grid.layout, point);
                     if (field < 3) {
-                        int left = locate(grid.layout, point - axis_vector(field, grid.layout.h * .001f));
+                        float epsilon = grid.layout.h * .001f;
+                        int left      = locate(grid.layout, float3{point.x - (field == 0 ? epsilon : 0), point.y - (field == 1 ? epsilon : 0), point.z - (field == 2 ? epsilon : 0)});
                         if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
                     }
                     if (i < 0)
-                        for (int corner = 1; corner < 8 && i < 0; ++corner) i = locate(grid.layout, point - float3{(corner & 1 ? .002f : 0) * h, (corner & 2 ? .002f : 0) * h, (corner & 4 ? .002f : 0) * h});
+                        for (int corner = 1; corner < 8 && i < 0; ++corner) i = locate(grid.layout, float3{point.x - (corner & 1 ? .002f : 0) * h, point.y - (corner & 2 ? .002f : 0) * h, point.z - (corner & 4 ? .002f : 0) * h});
                     float value = i < 0 ? background : native_sample(grid, fields, point, field, i);
                     sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
                     lo = fminf(lo, value);

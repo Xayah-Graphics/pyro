@@ -6,19 +6,19 @@ import std;
 
 export namespace pyro::lfm {
     struct Config {
-        float cellSize{1.0f / 128};
+        float cell_size{1.0f / 128};
         std::array<float, 3> origin{};
         std::array<int, 3> resolution{256, 128, 128};
         std::array<float, 3> wind{0.5638156f, 0.2052121f, 0};
-        int cycleSteps{5};
-        float pressureRelativeTolerance{1.e-5f}, divergenceTolerance{2.e-4f};
-        int pressureMaxIterations{200};
+        int cycle_steps{5};
+        float pressure_relative_tolerance{1.e-5f}, divergence_tolerance{2.e-4f};
+        int pressure_max_iterations{200};
     };
     struct Statistics {
-        int fluidCells{}, substeps{}, pressureIterations{}, pressureLevels{};
-        float maxDivergence{}, maxSpeed{}, stepMilliseconds{};
-        float geometryMilliseconds{}, advectionMilliseconds{}, flowMapMilliseconds{}, projectionMilliseconds{}, statisticsMilliseconds{};
-        unsigned long long allocatedBytes{};
+        int fluid_cells{}, substeps{}, pressure_iterations{}, pressure_levels{};
+        float max_divergence{}, max_speed{}, step_milliseconds{};
+        float geometry_milliseconds{}, advection_milliseconds{}, flow_map_milliseconds{}, projection_milliseconds{}, statistics_milliseconds{};
+        unsigned long long allocated_bytes{};
     };
     struct Solver {
         const Config config;
@@ -31,7 +31,6 @@ export namespace pyro::lfm {
         ~Solver();
         int add_mesh(std::span<const Triangle> triangles);
         void set_colliders(std::span<const Collider> colliders);
-        // One complete reinitialization cycle; all cycleSteps use duration / cycleSteps.
         void advance(double duration);
         void synchronize();
         void checkpoint(const char* path, bool restore);
@@ -48,8 +47,8 @@ export namespace pyro::lfm {
         std::vector<cudaEvent_t> events;
         std::vector<float> output;
         cuda::Collider* colliders{};
-        int colliderCount{};
-        bool geometryDirty{true};
+        int collider_count{};
+        bool geometry_dirty{true};
 
         template <typename T>
         void allocate(T*& pointer, std::size_t count);

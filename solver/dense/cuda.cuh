@@ -1,24 +1,23 @@
 #ifndef PYRO_DENSE_CUDA_CUH
 #define PYRO_DENSE_CUDA_CUH
 #include "../geometry.cuh"
-#include "../pressure.cuh"
 namespace pyro::cuda::dense {
-    inline constexpr int tileCells = 1024;
+    inline constexpr int tile_cells = 1024, threads = 256;
     struct Config {
-        float cellSize{0.05f};
+        float cell_size{0.05f};
         float3 origin{-3.2f, -0.8f, -3.2f};
         int3 resolution{128, 192, 128};
         float cfl{0.75f};
-        float maxTimeStep{1.0f / 48.0f};
+        float max_time_step{1.0f / 48.0f};
         float buoyancy{1.0f};
-        float smokeWeight{0.05f};
+        float smoke_weight{0.05f};
         float3 up{0.0f, 1.0f, 0.0f};
         float3 wind{};
         float cooling{0.1f};
         float dissipation{0.01f};
-        float pressureRelativeTolerance{1.0e-5f};
-        float divergenceTolerance{2.0e-4f}; // Absolute max divergence, in inverse seconds.
-        int pressureMaxIterations{200};
+        float pressure_relative_tolerance{1.0e-5f};
+        float divergence_tolerance{2.0e-4f};
+        int pressure_max_iterations{200};
     };
 
 
@@ -33,8 +32,6 @@ namespace pyro::cuda::dense {
         float* smoke{};
         float* temperature{};
     };
-    // Physical cells start at (1,1,1); positive MAC faces/corners use the
-    // upper ghost plane. Row pitch is padded to a warp-sized multiple.
     struct Layout {
         int3 size{};
         int pitch{}, slice{}, cells{}, blocks{};
@@ -42,14 +39,14 @@ namespace pyro::cuda::dense {
     struct Grid {
         Layout layout;
         float3 origin{};
-        int3 geometryLower{}, geometryExtent{};
+        int3 geometry_lower{}, geometry_extent{};
         unsigned char* fluid{};
         float* aperture[3]{};
-        float* solidVelocity[3]{};
-        float* solidDivergence{};
+        float* solid_velocity[3]{};
+        float* solid_divergence{};
         float* distance[3]{};
-        float geometryTime{}, geometryDuration{}, colliderSpeed{};
-        bool staticGeometry{true};
+        float geometry_time{}, geometry_duration{}, collider_speed{};
+        bool static_geometry{true};
         Fields state, midpoint, next, transported;
     };
     struct PressureLevel {
@@ -63,15 +60,21 @@ namespace pyro::cuda::dense {
         float* temporary{};
     };
 
+    struct IterationState {
+        double rz{}, previous_rz{}, denominator{}, initial_norm{};
+        float max_residual{};
+        int iterations{}, converged{}, failed{};
+    };
+
     struct PressureWorkspace {
         PressureLevel* levels{};
-        int levelCount{};
+        int level_count{};
         float* direction{};
         float* product{};
         float* solution{};
         float* residual{};
         int* parents{};
-        int* openComponents{};
+        int* open_components{};
         unsigned char* anchors{};
         double* reductions{};
         IterationState* iteration{};
@@ -81,10 +84,10 @@ namespace pyro::cuda::dense {
     void initialize_grid(Grid grid, float3 wind, cudaStream_t stream);
     void sample_geometry(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
     void update_boundary(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream);
-    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float startTime, float dt, cudaStream_t stream);
+    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float start_time, float dt, cudaStream_t stream);
     void cache_source(Grid grid, Config config, const Source* sources, int index, SourceRegion region, cudaStream_t stream);
-    void apply_sources_forces(Grid grid, Config config, Fields destination, Fields forceFields, const Source* sources, const SourceRegion* regions, int count, float time, float dt, cudaStream_t stream);
-    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream);
+    void apply_sources_forces(Grid grid, Config config, Fields destination, Fields force_fields, const Source* sources, const SourceRegion* regions, int count, float time, float dt, cudaStream_t stream);
+    void measure(Grid grid, Fields fields, Config config, const Source* sources, int source_count, float time, double* reductions, float* maximum, bool full, cudaStream_t stream);
     void assemble_pressure(Grid grid, Fields fields, PressureWorkspace workspace, float h, bool obstacles, bool rebuild, cudaStream_t stream);
     void coarse_matrix(PressureLevel fine, PressureLevel coarse, cudaStream_t stream);
     void begin_pressure(PressureWorkspace workspace, Config config, cudaStream_t stream);
@@ -138,12 +141,14 @@ namespace pyro::cuda::dense {
     }
 
     __device__ inline float sample_boundary(Grid grid, float3 world, float time, float h) {
-        if (grid.staticGeometry) return sample(grid.layout, grid.distance[0], (world - grid.origin) / h, 4.0f * h);
-        float fraction = fminf(2.0f, fmaxf(0.0f, 2.0f * (time - grid.geometryTime) / grid.geometryDuration));
+        float inverse_h = 1.0f / h;
+        float3 position{(world.x - grid.origin.x) * inverse_h, (world.y - grid.origin.y) * inverse_h, (world.z - grid.origin.z) * inverse_h};
+        if (grid.static_geometry) return sample(grid.layout, grid.distance[0], position, 4.0f * h);
+        float fraction = fminf(2.0f, fmaxf(0.0f, 2.0f * (time - grid.geometry_time) / grid.geometry_duration));
         int lower      = fraction < 1.0f ? 0 : 1;
         float weight   = fraction - lower;
-        float a        = sample(grid.layout, grid.distance[lower], (world - grid.origin) / h, 4.0f * h);
-        float b        = sample(grid.layout, grid.distance[lower + 1], (world - grid.origin) / h, 4.0f * h);
+        float a        = sample(grid.layout, grid.distance[lower], position, 4.0f * h);
+        float b        = sample(grid.layout, grid.distance[lower + 1], position, 4.0f * h);
         return a + (b - a) * weight;
     }
 

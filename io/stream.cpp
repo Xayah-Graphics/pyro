@@ -47,49 +47,49 @@ namespace pyro {
                     read(collider.mesh);
                     collider.shape = Shape::mesh;
                     read(collider.motion);
-                    read(collider.surfaceOffset);
+                    read(collider.surface_offset);
                 }
                 solver.set_colliders(colliders);
             }
-            float frameMilliseconds = 0;
-            int frameSubsteps = 0, frameIterations = 0;
+            float frame_milliseconds = 0;
+            int frame_substeps = 0, frame_iterations = 0;
             write('K');
             std::cout.flush();
             for (;;) {
                 char command;
                 read(command);
                 if (command == 'A') {
-                    double endTime;
-                    int sourceCount, colliderCount;
-                    read(endTime);
+                    double end_time;
+                    int source_count, collider_count;
+                    read(end_time);
                     if constexpr (!std::same_as<Solver, lfm::Solver>) {
-                        read(sourceCount);
-                        read(colliderCount);
-                        sources.resize(sourceCount);
-                        colliders.resize(colliderCount);
+                        read(source_count);
+                        read(collider_count);
+                        sources.resize(source_count);
+                        colliders.resize(collider_count);
                         for (auto& source : sources) {
                             read(source.mesh);
                             source.shape = Shape::mesh;
                             read(source.motion);
-                            read(source.smokeRate);
-                            read(source.temperatureRate);
-                            read(source.velocityRate);
+                            read(source.smoke_rate);
+                            read(source.temperature_rate);
+                            read(source.velocity_rate);
                             read(source.velocity);
-                            read(source.inheritVelocity);
+                            read(source.inherit_velocity);
                         }
                         for (auto& collider : colliders) {
                             read(collider.mesh);
                             collider.shape = Shape::mesh;
                             read(collider.motion);
-                            read(collider.surfaceOffset);
+                            read(collider.surface_offset);
                         }
-                        solver.set_sources(sources.data(), sourceCount);
-                        solver.set_colliders(colliders.data(), colliderCount);
+                        solver.set_sources(sources.data(), source_count);
+                        solver.set_colliders(colliders.data(), collider_count);
                     }
-                    solver.advance(endTime - solver.time);
-                    frameMilliseconds += solver.statistics.stepMilliseconds;
-                    frameSubsteps += solver.statistics.substeps;
-                    frameIterations += solver.statistics.pressureIterations;
+                    solver.advance(end_time - solver.time);
+                    frame_milliseconds += solver.statistics.step_milliseconds;
+                    frame_substeps += solver.statistics.substeps;
+                    frame_iterations += solver.statistics.pressure_iterations;
                     write('K');
                 } else if (command == 'F') {
                     int frame;
@@ -102,7 +102,7 @@ namespace pyro {
                             if constexpr (std::same_as<Solver, lfm::Solver>) return solver.download_vorticity();
                             else return solver.download_density();
                         }();
-                        float exportMilliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
+                        float export_milliseconds = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
                         int blocks = 0, capacity = 0, levels = 1;
                         std::array<float, 3> origin{};
                         std::array<int, 3> resolution{};
@@ -120,26 +120,26 @@ namespace pyro {
                         write(frame);
                         write(static_cast<int>(density.size()));
                         write(solver.time);
-                        write(config.cellSize);
-                        write(frameMilliseconds);
-                        write(exportMilliseconds);
+                        write(config.cell_size);
+                        write(frame_milliseconds);
+                        write(export_milliseconds);
                         write(blocks);
-                        write(stats.fluidCells);
-                        write(stats.maxDivergence);
-                        write(stats.allocatedBytes);
-                        write(stats.maxSpeed);
-                        write(frameSubsteps);
-                        write(frameIterations);
+                        write(stats.fluid_cells);
+                        write(stats.max_divergence);
+                        write(stats.allocated_bytes);
+                        write(stats.max_speed);
+                        write(frame_substeps);
+                        write(frame_iterations);
                         if constexpr (std::same_as<Solver, lfm::Solver>) write(0.0);
-                        else write(stats.smokeIntegral);
+                        else write(stats.smoke_integral);
                         write(capacity);
                         write(origin);
                         write(resolution);
                         write(levels);
                         if (!density.empty()) std::cout.write(reinterpret_cast<const char*>(density.data()), static_cast<std::streamsize>(density.size_bytes()));
                     } else write('K');
-                    frameMilliseconds = 0;
-                    frameSubsteps = frameIterations = 0;
+                    frame_milliseconds = 0;
+                    frame_substeps = frame_iterations = 0;
                 } else if (command == 'S' || command == 'L') {
                     unsigned size;
                     read(size);

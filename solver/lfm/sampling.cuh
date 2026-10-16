@@ -3,8 +3,6 @@
 #include "cuda.cuh"
 
 namespace pyro::cuda::lfm {
-    // Position and derivatives are in cell coordinates. All trajectory integrators
-    // therefore use dt / h; world origin is needed only for geometry and export.
     template <bool gradient>
     __device__ inline float sample_axis(Layout layout, const float* field, float3 position, int axis, float3& derivative) {
         float q[3]{position.x - (axis != 0 ? .5f : 0), position.y - (axis != 1 ? .5f : 0), position.z - (axis != 2 ? .5f : 0)};
@@ -55,7 +53,7 @@ namespace pyro::cuda::lfm {
     __device__ inline float3 sample_tangent(Grid grid, Velocity velocity, float3 p, float3 tangent, float3& derivative) {
         float3 dx, dy, dz;
         float3 u{sample_axis<true>(grid.faces[0], velocity.axis[0], p, 0, dx), sample_axis<true>(grid.faces[1], velocity.axis[1], p, 1, dy), sample_axis<true>(grid.faces[2], velocity.axis[2], p, 2, dz)};
-        derivative = {dot(dx, tangent), dot(dy, tangent), dot(dz, tangent)};
+        derivative = {dx.x * tangent.x + dx.y * tangent.y + dx.z * tangent.z, dy.x * tangent.x + dy.y * tangent.y + dy.z * tangent.z, dz.x * tangent.x + dz.y * tangent.y + dz.z * tangent.z};
         return u;
     }
 } // namespace pyro::cuda::lfm

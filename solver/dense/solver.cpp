@@ -9,11 +9,11 @@ namespace pyro::dense {
     static_assert(sizeof(Triangle) == sizeof(cuda::Triangle));
 
     Solver::Solver(const Config& settings) : config(settings), parameters(std::bit_cast<cuda::dense::Config>(settings)) {
-        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        if (auto cuda_result = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         cudaMemPool_t pool;
-        cuda_check(cudaDeviceGetDefaultMemPool(&pool, 0));
+        if (auto cuda_result = cudaDeviceGetDefaultMemPool(&pool, 0); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         unsigned long long threshold = ~0ull;
-        cuda_check(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold));
+        if (auto cuda_result = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         try {
             grid.origin     = parameters.origin;
             pressure.levels = new cuda::dense::PressureLevel[std::bit_width(static_cast<unsigned>(std::ranges::max(config.resolution)))]{};
@@ -24,10 +24,10 @@ namespace pyro::dense {
                 layout.size      = size;
                 layout.pitch     = (size.x + 2 + 31) / 32 * 32;
                 layout.slice     = layout.pitch * (size.y + 2);
-                layout.cells     = (layout.slice * (size.z + 2) + cuda::dense::tileCells - 1) / cuda::dense::tileCells * cuda::dense::tileCells;
-                layout.blocks    = layout.cells / cuda::dense::tileCells;
+                layout.cells     = (layout.slice * (size.z + 2) + cuda::dense::tile_cells - 1) / cuda::dense::tile_cells * cuda::dense::tile_cells;
+                layout.blocks    = layout.cells / cuda::dense::tile_cells;
                 level.coarsening = {size.x > 1 ? 2 : 1, size.y > 1 ? 2 : 1, size.z > 1 ? 2 : 1};
-                ++pressure.levelCount;
+                ++pressure.level_count;
                 allocate(level.diagonal, layout.cells);
                 allocate(level.boundary, layout.cells);
                 for (auto& a : level.face) allocate(a, layout.cells);
@@ -40,10 +40,10 @@ namespace pyro::dense {
             grid.layout = pressure.levels[0].layout;
             auto cells  = grid.layout.cells;
             allocate(grid.fluid, cells);
-            allocate(grid.solidDivergence, cells);
+            allocate(grid.solid_divergence, cells);
             for (auto& phi : grid.distance) allocate(phi, cells);
             for (auto& a : grid.aperture) allocate(a, cells);
-            for (auto& u : grid.solidVelocity) allocate(u, cells);
+            for (auto& u : grid.solid_velocity) allocate(u, cells);
             cuda::dense::Fields* fields[]{&grid.state, &grid.midpoint, &grid.next};
             for (auto field : fields) {
                 for (auto& u : field->velocity) allocate(u, cells, false);
@@ -54,9 +54,6 @@ namespace pyro::dense {
             allocate(pressure.product, cells, false);
             allocate(pressure.solution, cells, false);
             allocate(pressure.residual, cells, false);
-            // Advection and projection never overlap. Reuse Krylov work vectors
-            // for the forward transport pass; each pressure solve starts afresh.
-            // initialize_grid writes all four fields, including their padding.
             grid.transported.velocity[0] = pressure.direction;
             grid.transported.velocity[1] = pressure.product;
             grid.transported.velocity[2] = pressure.solution;
@@ -64,12 +61,13 @@ namespace pyro::dense {
             grid.transported.temperature = pressure.levels[0].solution;
 
             allocate(pressure.parents, cells);
-            allocate(pressure.openComponents, cells);
+            allocate(pressure.open_components, cells);
             allocate(pressure.anchors, cells);
             allocate(pressure.reductions, grid.layout.blocks * 6ull + 6);
             allocate(pressure.iteration, 1);
             allocate(maximum, 2);
-            for (auto& event : events) cuda_check(cudaEventCreate(&event));
+            for (auto& event : events)
+                if (auto cuda_result = cudaEventCreate(&event); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             cuda::dense::initialize_grid(grid, parameters.wind, stream);
             synchronize();
         } catch (...) {
@@ -83,40 +81,59 @@ namespace pyro::dense {
     }
 
     void Solver::set_sources(const Source* data, int count) {
-        if (!sources_changed(std::span(data, static_cast<std::size_t>(count)), sourceInputs)) return;
-        if (count > sourceCapacity) {
-            release(sources, sourceCapacity);
-            allocate(sources, count);
-            sourceCapacity = count;
+        bool changed = source_inputs.size() != static_cast<std::size_t>(count);
+        for (int i = 0; i < count && !changed; ++i) {
+            const auto& current   = data[i];
+            const auto& previous  = source_inputs[i];
+            bool geometry_changed = current.shape != previous.shape;
+            if (!geometry_changed) {
+                if (current.shape == Shape::mesh) geometry_changed = current.mesh != previous.mesh || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || std::ranges::any_of(current.motion.derivative, [](float value) { return value != 0; }) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
+                else geometry_changed = current.center != previous.center || current.half_extent != previous.half_extent;
+            }
+            changed = geometry_changed || current.velocity != previous.velocity || current.smoke_rate != previous.smoke_rate || current.temperature_rate != previous.temperature_rate || current.velocity_rate != previous.velocity_rate || current.start_time != previous.start_time || current.end_time != previous.end_time || current.inherit_velocity != previous.inherit_velocity || current.motion.max_speed != previous.motion.max_speed;
         }
-        sourceCount = count;
-        for (int i = count; i < static_cast<int>(sourceRegions.size()); ++i) release(sourceRegions[i].weights, sourceRegions[i].capacity * 4ull);
-        sourceRegions.resize(count);
+        if (!changed) return;
+        if (count > source_capacity) {
+            release(sources, source_capacity);
+            allocate(sources, count);
+            source_capacity = count;
+        }
+        source_count = count;
+        for (int i = count; i < static_cast<int>(source_regions.size()); ++i) release(source_regions[i].weights, source_regions[i].capacity * 4ull);
+        source_regions.resize(count);
         if (!count) {
-            sourceInputs.clear();
+            source_inputs.clear();
             return;
         }
         std::vector<cuda::Source> upload(count);
         std::vector<int> cache;
         for (int i = 0; i < count; ++i) {
             const auto& source = data[i];
-            upload[i]          = device_input(source, meshes);
-            if (i < static_cast<int>(sourceInputs.size()) && !source_geometry_changed(source, sourceInputs[i])) continue;
-            auto& region  = sourceRegions[i];
+            upload[i]          = {std::bit_cast<float3>(source.center), std::bit_cast<float3>(source.half_extent), std::bit_cast<float3>(source.velocity), source.smoke_rate, source.temperature_rate, source.velocity_rate, source.start_time, source.end_time, static_cast<cuda::Shape>(source.shape), source.shape == Shape::mesh ? meshes[source.mesh] : cuda::Mesh{}, std::bit_cast<cuda::Motion>(source.motion), source.inherit_velocity};
+            if (i < static_cast<int>(source_inputs.size())) {
+                const auto& previous  = source_inputs[i];
+                bool geometry_changed = source.shape != previous.shape;
+                if (!geometry_changed) {
+                    if (source.shape == Shape::mesh) geometry_changed = source.mesh != previous.mesh || source.motion.swept.lower != previous.motion.swept.lower || source.motion.swept.upper != previous.motion.swept.upper || !std::ranges::equal(source.motion.matrix, previous.motion.matrix) || std::ranges::any_of(source.motion.derivative, [](float value) { return value != 0; }) || std::ranges::any_of(previous.motion.derivative, [](float value) { return value != 0; });
+                    else geometry_changed = source.center != previous.center || source.half_extent != previous.half_extent;
+                }
+                if (!geometry_changed) continue;
+            }
+            auto& region  = source_regions[i];
             region.cached = source.shape != Shape::mesh || std::ranges::all_of(source.motion.derivative, [](float d) { return d == 0; });
             cuda::Bounds bounds;
             if (source.shape == Shape::mesh) bounds = std::bit_cast<cuda::Bounds>(source.motion.swept);
             else {
-                auto extent = source.halfExtent;
-                if (source.shape == Shape::sphere) extent.fill(source.halfExtent[0]);
+                auto extent = source.half_extent;
+                if (source.shape == Shape::sphere) extent.fill(source.half_extent[0]);
                 bounds.lower = {source.center[0] - extent[0], source.center[1] - extent[1], source.center[2] - extent[2]};
                 bounds.upper = {source.center[0] + extent[0], source.center[1] + extent[1], source.center[2] + extent[2]};
             }
             auto low = std::bit_cast<std::array<float, 3>>(bounds.lower), high = std::bit_cast<std::array<float, 3>>(bounds.upper);
             std::array<int, 3> lower, extent;
             for (int axis = 0; axis < 3; ++axis) {
-                lower[axis]  = std::max(0, int(std::floor((low[axis] - config.origin[axis]) / config.cellSize)) - 1);
-                int upper    = std::min(config.resolution[axis], int(std::ceil((high[axis] - config.origin[axis]) / config.cellSize)) + 1);
+                lower[axis]  = std::max(0, int(std::floor((low[axis] - config.origin[axis]) / config.cell_size)) - 1);
+                int upper    = std::min(config.resolution[axis], int(std::ceil((high[axis] - config.origin[axis]) / config.cell_size)) + 1);
                 extent[axis] = std::max(0, upper - lower[axis] + 1);
             }
             region.lower  = std::bit_cast<int3>(lower);
@@ -129,167 +146,185 @@ namespace pyro::dense {
             }
             if (region.cached) cache.push_back(i);
         }
-        cuda_check(cudaMemcpyAsync(sources, upload.data(), count * sizeof(cuda::Source), cudaMemcpyHostToDevice, stream));
-        for (int i : cache) cuda::dense::cache_source(grid, parameters, sources, i, sourceRegions[i], stream);
-        sourceInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
+        if (auto cuda_result = cudaMemcpyAsync(sources, upload.data(), count * sizeof(cuda::Source), cudaMemcpyHostToDevice, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        for (int i : cache) cuda::dense::cache_source(grid, parameters, sources, i, source_regions[i], stream);
+        source_inputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
 
         synchronize();
     }
 
     void Solver::set_colliders(const Collider* data, int count) {
-        bool changed        = !grid.staticGeometry || colliderInputs.size() != static_cast<std::size_t>(count);
-        grid.staticGeometry = true;
+        bool changed         = !grid.static_geometry || collider_inputs.size() != static_cast<std::size_t>(count);
+        grid.static_geometry = true;
         for (int i = 0; i < count; ++i) {
             const auto& current = data[i];
             if (current.shape == Shape::mesh) {
-                for (float derivative : current.motion.derivative) grid.staticGeometry &= derivative == 0.0f;
+                for (float derivative : current.motion.derivative) grid.static_geometry &= derivative == 0.0f;
             } else {
-                for (float velocity : current.linearVelocity) grid.staticGeometry &= velocity == 0.0f;
-                for (float velocity : current.angularVelocity) grid.staticGeometry &= velocity == 0.0f;
+                for (float velocity : current.linear_velocity) grid.static_geometry &= velocity == 0.0f;
+                for (float velocity : current.angular_velocity) grid.static_geometry &= velocity == 0.0f;
             }
             if (!changed) {
-                const auto& previous = colliderInputs[i];
-                changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.surfaceOffset != previous.surfaceOffset;
-                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || current.motion.maxSpeed != previous.motion.maxSpeed;
-                else changed |= current.center != previous.center || current.halfExtent != previous.halfExtent || current.orientation != previous.orientation;
+                const auto& previous = collider_inputs[i];
+                changed              = current.shape != previous.shape || current.mesh != previous.mesh || current.surface_offset != previous.surface_offset;
+                if (current.shape == Shape::mesh) changed |= !std::ranges::equal(current.motion.matrix, previous.motion.matrix) || current.motion.swept.lower != previous.motion.swept.lower || current.motion.swept.upper != previous.motion.swept.upper || current.motion.max_speed != previous.motion.max_speed;
+                else changed |= current.center != previous.center || current.half_extent != previous.half_extent || current.orientation != previous.orientation;
             }
         }
-        changed |= !grid.staticGeometry;
+        changed |= !grid.static_geometry;
         if (!changed) return;
-        geometryDirty      = true;
-        grid.colliderSpeed = collider_speed(std::span(data, static_cast<std::size_t>(count)));
-        colliderInputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
-        if (count > colliderCapacity) {
-            release(colliders, colliderCapacity);
-            allocate(colliders, count);
-            colliderCapacity = count;
+        geometry_dirty = true;
+        double speed   = 0;
+        for (int i = 0; i < count; ++i) {
+            const auto& collider = data[i];
+            double bound         = collider.motion.max_speed;
+            if (collider.shape != Shape::mesh) {
+                double linear = 0, angular = 0, extent = 0;
+                for (int axis = 0; axis < 3; ++axis) {
+                    linear += double(collider.linear_velocity[axis]) * collider.linear_velocity[axis];
+                    angular += double(collider.angular_velocity[axis]) * collider.angular_velocity[axis];
+                    extent += double(collider.half_extent[axis]) * collider.half_extent[axis];
+                }
+                bound = std::sqrt(linear) + std::sqrt(angular) * std::sqrt(extent);
+            }
+            speed = std::max(speed, bound);
         }
-        colliderCount = count;
+        grid.collider_speed = speed > 0 ? std::nextafter(static_cast<float>(speed), std::numeric_limits<float>::infinity()) : 0;
+        collider_inputs.assign_range(std::span(data, static_cast<std::size_t>(count)));
+        if (count > collider_capacity) {
+            release(colliders, collider_capacity);
+            allocate(colliders, count);
+            collider_capacity = count;
+        }
+        collider_count = count;
         if (!count) return;
         std::vector<cuda::Collider> upload(count);
-        for (int i = 0; i < count; ++i) upload[i] = device_input(data[i], meshes);
-        cuda_check(cudaMemcpyAsync(colliders, upload.data(), count * sizeof(cuda::Collider), cudaMemcpyHostToDevice, stream));
+        for (int i = 0; i < count; ++i) {
+            const auto& collider = data[i];
+            upload[i]            = {std::bit_cast<float3>(collider.center), std::bit_cast<float3>(collider.half_extent), std::bit_cast<float4>(collider.orientation), std::bit_cast<float3>(collider.linear_velocity), std::bit_cast<float3>(collider.angular_velocity), collider.pose_time, static_cast<cuda::Shape>(collider.shape), collider.shape == Shape::mesh ? meshes[collider.mesh] : cuda::Mesh{}, std::bit_cast<cuda::Motion>(collider.motion), collider.surface_offset};
+        }
+        if (auto cuda_result = cudaMemcpyAsync(colliders, upload.data(), count * sizeof(cuda::Collider), cudaMemcpyHostToDevice, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         synchronize();
     }
 
     int Solver::add_mesh(std::span<const Triangle> triangles) {
-        auto mesh = upload_mesh(triangles, config.cellSize * 4, stream);
+        auto mesh = upload_mesh(triangles, config.cell_size * 4, stream);
         meshes.push_back(mesh);
-        statistics.allocatedBytes += triangles.size() * (sizeof(cuda::Triangle) + sizeof(int)) + mesh.leafCount * 2ull * sizeof(cuda::Bounds);
+        statistics.allocated_bytes += triangles.size() * (sizeof(cuda::Triangle) + sizeof(int)) + mesh.leaf_count * 2ull * sizeof(cuda::Bounds);
         return static_cast<int>(meshes.size()) - 1;
     }
 
     void Solver::advance(double duration) {
-        auto begin                = std::chrono::steady_clock::now();
-        auto bytes                = statistics.allocatedBytes;
-        statistics                = {};
-        statistics.allocatedBytes = bytes;
-        auto elapsed              = [&](int a, int b) {
+        auto begin                 = std::chrono::steady_clock::now();
+        auto bytes                 = statistics.allocated_bytes;
+        statistics                 = {};
+        statistics.allocated_bytes = bytes;
+        auto elapsed               = [&](int a, int b) {
             float milliseconds;
-            cuda_check(cudaEventElapsedTime(&milliseconds, events[a], events[b]));
+            if (auto cuda_result = cudaEventElapsedTime(&milliseconds, events[a], events[b]); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             return milliseconds;
         };
-        double endTime = time + duration;
-        while (time < endTime) {
-            cuda_check(cudaEventRecord(events[0], stream));
-            if (!grid.staticGeometry || geometryDirty) {
+        double end_time = time + duration;
+        while (time < end_time) {
+            if (auto cuda_result = cudaEventRecord(events[0], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (!grid.static_geometry || geometry_dirty) {
                 std::array<float, 3> low{1.e30f, 1.e30f, 1.e30f}, high{-1.e30f, -1.e30f, -1.e30f};
-                for (const auto& body : colliderInputs) {
+                for (const auto& body : collider_inputs) {
                     for (int axis = 0; axis < 3; ++axis) {
                         float a, b;
                         if (body.shape == Shape::mesh) {
-                            a = body.motion.swept.lower[axis] - std::abs(body.surfaceOffset);
-                            b = body.motion.swept.upper[axis] + std::abs(body.surfaceOffset);
+                            a = body.motion.swept.lower[axis] - std::abs(body.surface_offset);
+                            b = body.motion.swept.upper[axis] + std::abs(body.surface_offset);
                         } else {
-                            float radius = body.shape == Shape::sphere ? body.halfExtent[0] : std::sqrt(body.halfExtent[0] * body.halfExtent[0] + body.halfExtent[1] * body.halfExtent[1] + body.halfExtent[2] * body.halfExtent[2]);
-                            float center = body.center[axis] + body.linearVelocity[axis] * (static_cast<float>(time) - body.poseTime);
-                            float next   = center + body.linearVelocity[axis] * config.maxTimeStep;
+                            float radius = body.shape == Shape::sphere ? body.half_extent[0] : std::sqrt(body.half_extent[0] * body.half_extent[0] + body.half_extent[1] * body.half_extent[1] + body.half_extent[2] * body.half_extent[2]);
+                            float center = body.center[axis] + body.linear_velocity[axis] * (static_cast<float>(time) - body.pose_time);
+                            float next   = center + body.linear_velocity[axis] * config.max_time_step;
                             a            = std::min(center, next) - radius;
                             b            = std::max(center, next) + radius;
                         }
-                        low[axis]  = std::min(low[axis], a - 4 * config.cellSize);
-                        high[axis] = std::max(high[axis], b + 4 * config.cellSize);
+                        low[axis]  = std::min(low[axis], a - 4 * config.cell_size);
+                        high[axis] = std::max(high[axis], b + 4 * config.cell_size);
                     }
                 }
                 std::array<int, 3> lower{}, extent{};
-                if (colliderCount)
+                if (collider_count)
                     for (int axis = 0; axis < 3; ++axis) {
-                        lower[axis]  = std::max(-1, int(std::floor((low[axis] - config.origin[axis]) / config.cellSize)) - 1);
-                        int upper    = std::min(config.resolution[axis], int(std::ceil((high[axis] - config.origin[axis]) / config.cellSize)) + 1);
+                        lower[axis]  = std::max(-1, int(std::floor((low[axis] - config.origin[axis]) / config.cell_size)) - 1);
+                        int upper    = std::min(config.resolution[axis], int(std::ceil((high[axis] - config.origin[axis]) / config.cell_size)) + 1);
                         extent[axis] = std::max(0, upper - lower[axis] + 1);
                     }
-                grid.geometryLower  = std::bit_cast<int3>(lower);
-                grid.geometryExtent = std::bit_cast<int3>(extent);
+                grid.geometry_lower  = std::bit_cast<int3>(lower);
+                grid.geometry_extent = std::bit_cast<int3>(extent);
 
-                cuda::dense::sample_geometry(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time), 0, stream);
-                cuda::dense::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time), 0, stream);
-                geometryDirty = false;
-                matrixDirty   = true;
+                cuda::dense::sample_geometry(grid, config.cell_size, colliders, collider_count, static_cast<float>(time), 0, stream);
+                cuda::dense::update_boundary(grid, config.cell_size, colliders, collider_count, static_cast<float>(time), 0, stream);
+                geometry_dirty = false;
+                matrix_dirty   = true;
             }
-            cuda_check(cudaEventRecord(events[1], stream));
-            cuda_check(cudaEventRecord(events[7], stream));
-            cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, static_cast<float>(time), pressure.reductions, maximum, false, stream);
-            cuda_check(cudaEventRecord(events[8], stream));
+            if (auto cuda_result = cudaEventRecord(events[1], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaEventRecord(events[7], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            cuda::dense::measure(grid, grid.state, parameters, sources, source_count, static_cast<float>(time), pressure.reductions, maximum, false, stream);
+            if (auto cuda_result = cudaEventRecord(events[8], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             float bounds[2];
-            cuda_check(cudaMemcpyAsync(bounds, maximum, sizeof(bounds), cudaMemcpyDeviceToHost, stream));
+            if (auto cuda_result = cudaMemcpyAsync(bounds, maximum, sizeof(bounds), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             synchronize();
-            statistics.geometryMilliseconds += elapsed(0, 1);
-            statistics.statisticsMilliseconds += elapsed(7, 8);
-            float distance        = config.cfl * config.cellSize;
-            float safeStep        = 2.0f * distance / (bounds[0] + std::sqrt(bounds[0] * bounds[0] + 4.0f * bounds[1] * distance) + 1.0e-20f);
-            float dt              = static_cast<float>(std::min(endTime - time, static_cast<double>(std::min(config.maxTimeStep, safeStep))));
-            grid.geometryTime     = static_cast<float>(time);
-            grid.geometryDuration = dt;
-            cuda_check(cudaEventRecord(events[0], stream));
-            if (!grid.staticGeometry)
-                for (int sample = 1; sample < 3; ++sample) cuda::dense::sample_geometry(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time) + dt * (0.5f * sample), sample, stream);
-            cuda_check(cudaEventRecord(events[1], stream));
+            statistics.geometry_milliseconds += elapsed(0, 1);
+            statistics.statistics_milliseconds += elapsed(7, 8);
+            float distance         = config.cfl * config.cell_size;
+            float safe_step        = 2.0f * distance / (bounds[0] + std::sqrt(bounds[0] * bounds[0] + 4.0f * bounds[1] * distance) + 1.0e-20f);
+            float dt               = static_cast<float>(std::min(end_time - time, static_cast<double>(std::min(config.max_time_step, safe_step))));
+            grid.geometry_time     = static_cast<float>(time);
+            grid.geometry_duration = dt;
+            if (auto cuda_result = cudaEventRecord(events[0], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (!grid.static_geometry)
+                for (int sample = 1; sample < 3; ++sample) cuda::dense::sample_geometry(grid, config.cell_size, colliders, collider_count, static_cast<float>(time) + dt * (0.5f * sample), sample, stream);
+            if (auto cuda_result = cudaEventRecord(events[1], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             for (int stage = 0; stage < 2; ++stage) {
-                float stageStep  = stage ? dt : dt * 0.5f;
+                float stage_step = stage ? dt : dt * 0.5f;
                 auto destination = stage ? grid.next : grid.midpoint;
                 auto carrier     = stage ? grid.midpoint : grid.state;
-                cuda_check(cudaEventRecord(events[2], stream));
-                cuda::dense::advect(grid, parameters, destination, grid.state, carrier, colliderCount != 0, static_cast<float>(time), stageStep, stream);
-                cuda_check(cudaEventRecord(events[3], stream));
-                cuda::dense::apply_sources_forces(grid, parameters, destination, carrier, sources, sourceRegions.data(), sourceCount, static_cast<float>(time), stageStep, stream);
-                cuda_check(cudaEventRecord(events[4], stream));
-                if (!grid.staticGeometry) {
-                    cuda::dense::update_boundary(grid, config.cellSize, colliders, colliderCount, static_cast<float>(time) + stageStep, stage + 1, stream);
-                    matrixDirty = true;
+                if (auto cuda_result = cudaEventRecord(events[2], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                cuda::dense::advect(grid, parameters, destination, grid.state, carrier, collider_count != 0, static_cast<float>(time), stage_step, stream);
+                if (auto cuda_result = cudaEventRecord(events[3], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                cuda::dense::apply_sources_forces(grid, parameters, destination, carrier, sources, source_regions.data(), source_count, static_cast<float>(time), stage_step, stream);
+                if (auto cuda_result = cudaEventRecord(events[4], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                if (!grid.static_geometry) {
+                    cuda::dense::update_boundary(grid, config.cell_size, colliders, collider_count, static_cast<float>(time) + stage_step, stage + 1, stream);
+                    matrix_dirty = true;
                 }
-                cuda_check(cudaEventRecord(events[5], stream));
+                if (auto cuda_result = cudaEventRecord(events[5], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
                 project(destination);
-                cuda_check(cudaEventRecord(events[6], stream));
-                cuda_check(cudaEventSynchronize(events[6]));
-                statistics.advectionMilliseconds += elapsed(2, 3);
-                statistics.forcesMilliseconds += elapsed(3, 4);
-                statistics.geometryMilliseconds += elapsed(4, 5);
-                statistics.projectionMilliseconds += elapsed(5, 6);
+                if (auto cuda_result = cudaEventRecord(events[6], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                if (auto cuda_result = cudaEventSynchronize(events[6]); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                statistics.advection_milliseconds += elapsed(2, 3);
+                statistics.forces_milliseconds += elapsed(3, 4);
+                statistics.geometry_milliseconds += elapsed(4, 5);
+                statistics.projection_milliseconds += elapsed(5, 6);
             }
-            statistics.geometryMilliseconds += elapsed(0, 1);
+            statistics.geometry_milliseconds += elapsed(0, 1);
             std::swap(grid.state, grid.next);
             time += dt;
             ++statistics.substeps;
         }
-        cuda_check(cudaEventRecord(events[7], stream));
-        cuda::dense::measure(grid, grid.state, parameters, sources, sourceCount, static_cast<float>(time), pressure.reductions, maximum, true, stream);
-        cuda_check(cudaEventRecord(events[8], stream));
+        if (auto cuda_result = cudaEventRecord(events[7], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        cuda::dense::measure(grid, grid.state, parameters, sources, source_count, static_cast<float>(time), pressure.reductions, maximum, true, stream);
+        if (auto cuda_result = cudaEventRecord(events[8], stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         double result[6];
-        cuda_check(cudaMemcpyAsync(result, pressure.reductions + grid.layout.blocks * 6ull, sizeof(result), cudaMemcpyDeviceToHost, stream));
+        if (auto cuda_result = cudaMemcpyAsync(result, pressure.reductions + grid.layout.blocks * 6ull, sizeof(result), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         synchronize();
-        statistics.statisticsMilliseconds += elapsed(7, 8);
-        statistics.fluidCells          = static_cast<int>(result[0]);
-        statistics.maxDivergence       = static_cast<float>(result[1]);
-        statistics.maxSpeed            = static_cast<float>(result[2]);
-        statistics.smokeIntegral       = result[3];
-        statistics.temperatureIntegral = result[4];
-        statistics.stepMilliseconds    = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
-        if (!std::isfinite(statistics.maxDivergence) || statistics.maxDivergence > config.divergenceTolerance) throw std::runtime_error("Dense projection divergence " + std::to_string(statistics.maxDivergence) + " exceeds " + std::to_string(config.divergenceTolerance));
+        statistics.statistics_milliseconds += elapsed(7, 8);
+        statistics.fluid_cells          = static_cast<int>(result[0]);
+        statistics.max_divergence       = static_cast<float>(result[1]);
+        statistics.max_speed            = static_cast<float>(result[2]);
+        statistics.smoke_integral       = result[3];
+        statistics.temperature_integral = result[4];
+        statistics.step_milliseconds    = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        if (!std::isfinite(statistics.max_divergence) || statistics.max_divergence > config.divergence_tolerance) throw std::runtime_error("Dense projection divergence " + std::to_string(statistics.max_divergence) + " exceeds " + std::to_string(config.divergence_tolerance));
     }
 
     void Solver::synchronize() {
-        cuda_check(cudaGetLastError());
-        cuda_check(cudaStreamSynchronize(stream));
+        if (auto cuda_result = cudaGetLastError(); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
     }
 
     void Solver::checkpoint(const char* path, bool restore) {
@@ -301,24 +336,24 @@ namespace pyro::dense {
             else file.write(static_cast<const char*>(data), bytes);
         };
         constexpr std::array format{'P', 'Y', 'R', 'O', 'D', 'N', '0', '1'};
-        auto storedFormat = format;
-        transfer(storedFormat.data(), storedFormat.size());
-        if (storedFormat != format) throw std::runtime_error("Unsupported dense checkpoint format");
+        auto stored_format = format;
+        transfer(stored_format.data(), stored_format.size());
+        if (stored_format != format) throw std::runtime_error("Unsupported dense checkpoint format");
         transfer(&time, sizeof(time));
         std::vector<float> buffer(grid.layout.cells);
         float* fields[]{grid.state.smoke, grid.state.temperature, grid.state.velocity[0], grid.state.velocity[1], grid.state.velocity[2]};
         for (auto field : fields) {
             if (restore) {
                 transfer(buffer.data(), buffer.size() * sizeof(float));
-                cuda_check(cudaMemcpyAsync(field, buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
+                if (auto cuda_result = cudaMemcpyAsync(field, buffer.data(), buffer.size() * sizeof(float), cudaMemcpyHostToDevice, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             } else {
-                cuda_check(cudaMemcpyAsync(buffer.data(), field, buffer.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                if (auto cuda_result = cudaMemcpyAsync(buffer.data(), field, buffer.size() * sizeof(float), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
                 synchronize();
                 transfer(buffer.data(), buffer.size() * sizeof(float));
             }
             if (restore) synchronize();
         }
-        if (restore) geometryDirty = matrixDirty = true;
+        if (restore) geometry_dirty = matrix_dirty = true;
     }
 
     std::span<const float> Solver::download_density() {
@@ -329,70 +364,70 @@ namespace pyro::dense {
         copy.dstPtr = make_cudaPitchedPtr(density.data(), config.resolution[0] * sizeof(float), config.resolution[0] * sizeof(float), config.resolution[1]);
         copy.extent = make_cudaExtent(config.resolution[0] * sizeof(float), config.resolution[1], config.resolution[2]);
         copy.kind   = cudaMemcpyDeviceToHost;
-        cuda_check(cudaMemcpy3DAsync(&copy, stream));
+        if (auto cuda_result = cudaMemcpy3DAsync(&copy, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         synchronize();
         return density;
     }
 
     template <typename T>
     void Solver::allocate(T*& pointer, unsigned long long count, bool clear) {
-        cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&pointer), count * sizeof(T), stream));
-        if (clear) cuda_check(cudaMemsetAsync(pointer, 0, count * sizeof(T), stream));
-        statistics.allocatedBytes += count * sizeof(T);
+        if (auto cuda_result = cudaMallocAsync(reinterpret_cast<void**>(&pointer), count * sizeof(T), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        if (clear)
+            if (auto cuda_result = cudaMemsetAsync(pointer, 0, count * sizeof(T), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        statistics.allocated_bytes += count * sizeof(T);
     }
 
     template <typename T>
     void Solver::release(T*& pointer, unsigned long long count) {
         if (!pointer) return;
-        cuda_check(cudaFreeAsync(pointer, stream));
+        if (auto cuda_result = cudaFreeAsync(pointer, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         pointer = nullptr;
-        statistics.allocatedBytes -= count * sizeof(T);
+        statistics.allocated_bytes -= count * sizeof(T);
     }
 
     void Solver::project(cuda::dense::Fields fields) {
         auto& workspace = pressure;
-        cuda::dense::assemble_pressure(grid, fields, workspace, config.cellSize, colliderCount != 0, matrixDirty, stream);
-        if (matrixDirty)
-            for (int l = 1; l < workspace.levelCount; ++l) cuda::dense::coarse_matrix(workspace.levels[l - 1], workspace.levels[l], stream);
-        matrixDirty = false;
-        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(cuda::IterationState), stream));
+        cuda::dense::assemble_pressure(grid, fields, workspace, config.cell_size, collider_count != 0, matrix_dirty, stream);
+        if (matrix_dirty)
+            for (int l = 1; l < workspace.level_count; ++l) cuda::dense::coarse_matrix(workspace.levels[l - 1], workspace.levels[l], stream);
+        matrix_dirty = false;
+        if (auto cuda_result = cudaMemsetAsync(workspace.iteration, 0, sizeof(cuda::dense::IterationState), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         cuda::dense::begin_pressure(workspace, parameters, stream);
         auto executable = workspace.graph;
         if (!executable) {
             cudaGraph_t graph;
-            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            if (auto cuda_result = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             for (int iteration = 0; iteration < 8; ++iteration) cuda::dense::iterate_pressure(workspace, parameters, stream);
-            cuda_check(cudaStreamEndCapture(stream, &graph));
-            cuda_check(cudaGraphInstantiate(&executable, graph, 0));
-            cuda_check(cudaGraphDestroy(graph));
+            if (auto cuda_result = cudaStreamEndCapture(stream, &graph); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaGraphInstantiate(&executable, graph, 0); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaGraphDestroy(graph); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             workspace.graph = executable;
         }
-        cuda::IterationState status{};
+        cuda::dense::IterationState status{};
         for (;;) {
-            int remaining = config.pressureMaxIterations - status.iterations;
-            if (remaining >= 8) cuda_check(cudaGraphLaunch(executable, stream));
-            else
+            int remaining = config.pressure_max_iterations - status.iterations;
+            if (remaining < 8)
                 for (int i = 0; i < remaining; ++i) cuda::dense::iterate_pressure(workspace, parameters, stream);
-            cuda_check(cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
+            else if (auto cuda_result = cudaGraphLaunch(executable, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             if (status.failed) break;
-            if (status.converged || status.iterations >= config.pressureMaxIterations) {
+            if (status.converged || status.iterations >= config.pressure_max_iterations) {
                 status.converged = 0;
-                cuda_check(cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
+                if (auto cuda_result = cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
                 cuda::dense::check_pressure(workspace, parameters, stream);
-                cuda_check(cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream));
-                cuda_check(cudaStreamSynchronize(stream));
-                if (status.maxResidual <= config.divergenceTolerance * 0.5f || status.failed || status.iterations >= config.pressureMaxIterations) break;
-                // Restart from the true residual when FP32 recursive CG loses accuracy.
+                if (auto cuda_result = cudaMemcpyAsync(&status, workspace.iteration, sizeof(status), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+                if (status.max_residual <= config.divergence_tolerance * 0.5f || status.failed || status.iterations >= config.pressure_max_iterations) break;
                 status.converged = 0;
-                cuda_check(cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream));
+                if (auto cuda_result = cudaMemcpyAsync(workspace.iteration, &status, sizeof(status), cudaMemcpyHostToDevice, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
                 cuda::dense::begin_pressure(workspace, parameters, stream);
             }
         }
-        if (status.failed || status.maxResidual > config.divergenceTolerance * 0.5f) throw std::runtime_error("Pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true residual=" + std::to_string(status.maxResidual));
-        cuda::dense::apply_pressure(grid, fields, workspace.solution, config.cellSize, parameters.wind, stream);
-        statistics.pressureIterations += status.iterations;
-        statistics.pressureLevels = workspace.levelCount;
+        if (status.failed || status.max_residual > config.divergence_tolerance * 0.5f) throw std::runtime_error("Pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true residual=" + std::to_string(status.max_residual));
+        cuda::dense::apply_pressure(grid, fields, workspace.solution, config.cell_size, parameters.wind, stream);
+        statistics.pressure_iterations += status.iterations;
+        statistics.pressure_levels = workspace.level_count;
     }
 
     void Solver::release_storage() {
@@ -400,17 +435,17 @@ namespace pyro::dense {
             if (pointer) cudaFreeAsync(pointer, stream);
         };
         free(grid.fluid);
-        free(grid.solidDivergence);
+        free(grid.solid_divergence);
         for (auto p : grid.distance) free(p);
         for (auto p : grid.aperture) free(p);
-        for (auto p : grid.solidVelocity) free(p);
+        for (auto p : grid.solid_velocity) free(p);
         cuda::dense::Fields fields[]{grid.state, grid.midpoint, grid.next};
         for (auto field : fields) {
             free(field.smoke);
             free(field.temperature);
             for (auto p : field.velocity) free(p);
         }
-        for (int l = 0; l < pressure.levelCount; ++l) {
+        for (int l = 0; l < pressure.level_count; ++l) {
             auto& level = pressure.levels[l];
             free(level.diagonal);
             free(level.boundary);
@@ -425,12 +460,12 @@ namespace pyro::dense {
         free(pressure.solution);
         free(pressure.residual);
         free(pressure.parents);
-        free(pressure.openComponents);
+        free(pressure.open_components);
         free(pressure.anchors);
         free(pressure.reductions);
         free(pressure.iteration);
         if (pressure.graph) cudaGraphExecDestroy(pressure.graph);
-        for (auto region : sourceRegions) free(region.weights);
+        for (auto region : source_regions) free(region.weights);
         free(sources);
         free(colliders);
         for (auto mesh : meshes) {

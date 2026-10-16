@@ -2,7 +2,6 @@
 #include <cub/cub.cuh>
 
 namespace pyro::cuda::sparse {
-    // Level descriptors are host data; kernels receive individual descriptors.
     __global__ void initialize_fine(Grid grid, PressureLevel fine, int* parents, int* open, unsigned char* anchors) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= fine.count) return;
@@ -16,19 +15,53 @@ namespace pyro::cuda::sparse {
         if (f >= grid.layout.count * 1728) return;
         Face face = grid.faces[f];
         if (face.weight <= 0 || face.left < 0 || face.right < 0) return;
-        int a = component_root(parents, face.left), b = component_root(parents, face.right);
+        int a = face.left, b = face.right;
+        int parent = atomicAdd(parents + a, 0);
+        while (parent != a) {
+            int next = atomicAdd(parents + parent, 0);
+            atomicMin(parents + a, next);
+            a      = parent;
+            parent = next;
+        }
+        parent = atomicAdd(parents + b, 0);
+        while (parent != b) {
+            int next = atomicAdd(parents + parent, 0);
+            atomicMin(parents + b, next);
+            b      = parent;
+            parent = next;
+        }
         while (a != b) {
             int high = max(a, b), low = min(a, b);
             int old = atomicCAS(parents + high, high, low);
             if (old == high) break;
-            a = component_root(parents, old);
-            b = component_root(parents, low);
+            a      = old;
+            parent = atomicAdd(parents + a, 0);
+            while (parent != a) {
+                int next = atomicAdd(parents + parent, 0);
+                atomicMin(parents + a, next);
+                a      = parent;
+                parent = next;
+            }
+            b      = low;
+            parent = atomicAdd(parents + b, 0);
+            while (parent != b) {
+                int next = atomicAdd(parents + parent, 0);
+                atomicMin(parents + b, next);
+                b      = parent;
+                parent = next;
+            }
         }
     }
     __global__ void mark_open(Grid grid, int* parents, int* open) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= grid.layout.count * 512) return;
-        int root = component_root(parents, i);
+        int root = i, parent = atomicAdd(parents + root, 0);
+        while (parent != root) {
+            int next = atomicAdd(parents + parent, 0);
+            atomicMin(parents + root, next);
+            root   = parent;
+            parent = next;
+        }
         atomicExch(parents + i, root);
         for (int a = 0; a < 3; ++a)
             for (int sign = -1; sign <= 1; sign += 2)
@@ -45,10 +78,6 @@ namespace pyro::cuda::sparse {
         int low = min(a, b), high = max(a, b);
         return grid.layout.count * 1728 + group * 6 + low * 3 - low * (low - 1) / 2 + high - low - 1;
     }
-    // A coarse face uses the area-weighted pressure of its four fine neighbors.
-    // Its energy is W * (p_coarse - sum(w_i*p_i)/W)^2. The negative peer
-    // edges below express that positive semidefinite rank-one term exactly;
-    // they are intentional and must survive Galerkin coarsening.
     __device__ Edge physical_edge(Grid grid, int f) {
         int count = grid.layout.count * 1728;
         if (f < count) {
@@ -68,11 +97,11 @@ namespace pyro::cuda::sparse {
     }
     __global__ void fine_edges(Grid grid, PressureLevel fine, const unsigned char* anchors) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;
-        if (f >= fine.edgeCount) return;
+        if (f >= fine.edge_count) return;
         Edge edge = physical_edge(grid, f);
         if (edge.left < 0 || edge.right < 0 || anchors[edge.left] || anchors[edge.right]) edge.weight = 0;
         fine.edges[f] = edge;
-        if (f < grid.layout.count * 1728) fine.faceWeights[f] = edge.weight;
+        if (f < grid.layout.count * 1728) fine.face_weights[f] = edge.weight;
     }
     __global__ void fine_diagonal(Grid grid, PressureLevel fine, const unsigned char* anchors) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -103,7 +132,7 @@ namespace pyro::cuda::sparse {
         fine.diagonal[i] = anchors[i] ? 1 : grid.fluid[i] ? float(diagonal) : 0;
     }
     bool fine_matrix(Grid grid, PressureWorkspace workspace, bool obstacles, cudaStream_t stream) {
-        cuda_check(cudaMemsetAsync(workspace.iteration, 0, sizeof(IterationState), stream));
+        if (auto cuda_result = cudaMemsetAsync(workspace.iteration, 0, sizeof(IterationState), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         auto fine = workspace.levels[0];
         initialize_fine<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.components, workspace.open, workspace.anchors);
         if (obstacles) {
@@ -111,12 +140,12 @@ namespace pyro::cuda::sparse {
             mark_open<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, workspace.components, workspace.open);
             mark_anchors<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, workspace.components, workspace.open, workspace.anchors, workspace.iteration);
         }
-        fine_edges<<<(fine.edgeCount + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.anchors);
+        fine_edges<<<(fine.edge_count + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.anchors);
         fine_diagonal<<<(fine.count + 255) / 256, 256, 0, stream>>>(grid, fine, workspace.anchors);
         int closed = 0;
         if (obstacles) {
-            cuda_check(cudaMemcpyAsync(&closed, &workspace.iteration->iterations, sizeof(int), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
+            if (auto cuda_result = cudaMemcpyAsync(&closed, &workspace.iteration->iterations, sizeof(int), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         }
         return closed != 0;
     }
@@ -151,25 +180,25 @@ namespace pyro::cuda::sparse {
         int count = coarse.count;
         if (!coarse.nodes) {
             parent_keys<<<(fine.count + 255) / 256, 256, 0, stream>>>(fine, scratch.keys[0], depth);
-            std::size_t bytes = scratch.sortBytes;
-            cuda_check(cub::DeviceRadixSort::SortKeys(scratch.sortStorage, bytes, scratch.keys[0], scratch.keys[1], fine.count, 0, 64, stream));
-            bytes = scratch.sortBytes;
-            cuda_check(cub::DeviceSelect::Unique(scratch.sortStorage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.count, stream));
-            cuda_check(cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
+            std::size_t bytes = scratch.sort_bytes;
+            if (auto cuda_result = cub::DeviceRadixSort::SortKeys(scratch.sort_storage, bytes, scratch.keys[0], scratch.keys[1], fine.count, 0, 64, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            bytes = scratch.sort_bytes;
+            if (auto cuda_result = cub::DeviceSelect::Unique(scratch.sort_storage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.count, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             return count;
         }
         coarse.count = count;
-        cuda_check(cudaMemsetAsync(coarse.children, 255, count * 8ull * sizeof(int), stream));
+        if (auto cuda_result = cudaMemsetAsync(coarse.children, 255, count * 8ull * sizeof(int), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         unpack_nodes<<<(count + 255) / 256, 256, 0, stream>>>(coarse, scratch.keys[2]);
         link_parents<<<(fine.count + 255) / 256, 256, 0, stream>>>(fine, coarse, scratch.keys[2], depth);
         return count;
     }
     __global__ void edge_keys(PressureLevel fine, unsigned long long* keys, float* values) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;
-        if (f >= fine.edgeCount) return;
+        if (f >= fine.edge_count) return;
         Edge edge            = fine.edges[f];
-        unsigned long long k = emptyKey;
+        unsigned long long k = empty_key;
         float value          = 0;
         if (edge.weight != 0 && edge.left >= 0 && edge.right >= 0) {
             int a = fine.parent[edge.left], b = fine.parent[edge.right];
@@ -183,7 +212,7 @@ namespace pyro::cuda::sparse {
     }
     __global__ void reduce_edges(PressureLevel coarse, const unsigned long long* sorted, const float* values, const unsigned long long* unique, int count) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;
-        if (f >= coarse.edgeCount) return;
+        if (f >= coarse.edge_count) return;
         auto k  = unique[f];
         int low = 0, high = count;
         while (low < high) {
@@ -231,22 +260,22 @@ namespace pyro::cuda::sparse {
     }
     int coarse_edges(PressureLevel fine, PressureLevel coarse, Scratch scratch, cudaStream_t stream) {
         int count = 0;
-        if (fine.edgeCount) {
-            edge_keys<<<(fine.edgeCount + 255) / 256, 256, 0, stream>>>(fine, scratch.keys[0], scratch.values[0]);
-            std::size_t bytes = scratch.sortBytes;
-            cuda_check(cub::DeviceRadixSort::SortPairs(scratch.sortStorage, bytes, scratch.keys[0], scratch.keys[1], scratch.values[0], scratch.values[1], fine.edgeCount, 0, 64, stream));
-            bytes = scratch.sortBytes;
-            cuda_check(cub::DeviceSelect::Unique(scratch.sortStorage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.edgeCount, stream));
-            cuda_check(cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
+        if (fine.edge_count) {
+            edge_keys<<<(fine.edge_count + 255) / 256, 256, 0, stream>>>(fine, scratch.keys[0], scratch.values[0]);
+            std::size_t bytes = scratch.sort_bytes;
+            if (auto cuda_result = cub::DeviceRadixSort::SortPairs(scratch.sort_storage, bytes, scratch.keys[0], scratch.keys[1], scratch.values[0], scratch.values[1], fine.edge_count, 0, 64, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            bytes = scratch.sort_bytes;
+            if (auto cuda_result = cub::DeviceSelect::Unique(scratch.sort_storage, bytes, scratch.keys[1], scratch.keys[2], scratch.count, fine.edge_count, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaMemcpyAsync(&count, scratch.count, sizeof(int), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
             unsigned long long last;
-            cuda_check(cudaMemcpyAsync(&last, scratch.keys[2] + count - 1, sizeof(last), cudaMemcpyDeviceToHost, stream));
-            cuda_check(cudaStreamSynchronize(stream));
-            if (last == emptyKey) --count;
+            if (auto cuda_result = cudaMemcpyAsync(&last, scratch.keys[2] + count - 1, sizeof(last), cudaMemcpyDeviceToHost, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (auto cuda_result = cudaStreamSynchronize(stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+            if (last == empty_key) --count;
         }
-        coarse.edgeCount = count;
-        cuda_check(cudaMemsetAsync(coarse.adjacency, 255, coarse.count * 24ull * sizeof(int), stream));
-        if (count) reduce_edges<<<(count + 255) / 256, 256, 0, stream>>>(coarse, scratch.keys[1], scratch.values[1], scratch.keys[2], fine.edgeCount);
+        coarse.edge_count = count;
+        if (auto cuda_result = cudaMemsetAsync(coarse.adjacency, 255, coarse.count * 24ull * sizeof(int), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        if (count) reduce_edges<<<(count + 255) / 256, 256, 0, stream>>>(coarse, scratch.keys[1], scratch.values[1], scratch.keys[2], fine.edge_count);
         coarse_diagonal<<<(coarse.count + 255) / 256, 256, 0, stream>>>(fine, coarse);
         return count;
     }
@@ -260,7 +289,7 @@ namespace pyro::cuda::sparse {
                     int coordinate = (i >> (3 * a)) & 7, stride = 1 << (3 * a);
                     if (coordinate + sign >= 0 && coordinate + sign < 8) {
                         int f = negative_face(i + (sign > 0 ? stride : 0), a);
-                        result += level.faceWeights[f] * (x[i] - x[i + sign * stride]);
+                        result += level.face_weights[f] * (x[i] - x[i + sign * stride]);
                         continue;
                     }
                     for (int f : cell_faces(grid, i, a, sign).face)
@@ -294,11 +323,11 @@ namespace pyro::cuda::sparse {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= fine.count) return;
         float h     = spacing(grid.layout, i);
-        double flux = -double(grid.solidDivergence[i]) * h * h * h;
+        double flux = -double(grid.solid_divergence[i]) * h * h * h;
         for (int a = 0; a < 3; ++a)
             for (int sign = -1; sign <= 1; sign += 2)
                 for (int f : cell_faces(grid, i, a, sign).face)
-                    if (f >= 0) flux += sign * (double(grid.faces[f].area) * fields.velocity[f] + grid.faces[f].solidFlux);
+                    if (f >= 0) flux += sign * (double(grid.faces[f].area) * fields.velocity[f] + grid.faces[f].solid_flux);
         fine.rhs[i] = residual[i] = grid.fluid[i] && !anchors[i] ? -flux / grid.layout.h : 0;
         solution[i]               = 0;
     }
@@ -309,8 +338,6 @@ namespace pyro::cuda::sparse {
         if (state->converged || state->failed) return;
         int i = blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= level.count) return;
-        // The flux-consistent interface adds signed peer couplings. Its
-        // normalized spectral upper bound is 3, not the M-matrix bound of 2.
         float theta = .5f * (upper + .3f), delta = .5f * (upper - .3f);
         float alpha    = 1.f / (theta - delta * delta / (2 * theta));
         float beta     = alpha * delta * delta / (2 * theta);
@@ -357,19 +384,19 @@ namespace pyro::cuda::sparse {
         if (i < level.count) level.solution[i] = x[i];
     }
     void precondition(Grid grid, PressureWorkspace workspace, cudaStream_t stream) {
-        for (int l = 0; l < workspace.levelCount; ++l) {
+        for (int l = 0; l < workspace.level_count; ++l) {
             auto level       = workspace.levels[l];
             const float* rhs = l ? level.rhs : workspace.residual;
-            if (l + 1 == workspace.levelCount) solve_coarsest<<<1, 256, 0, stream>>>(level, rhs, workspace.iteration);
+            if (l + 1 == workspace.level_count) solve_coarsest<<<1, 256, 0, stream>>>(level, rhs, workspace.iteration);
             else {
-                cuda_check(cudaMemsetAsync(level.solution, 0, level.count * sizeof(float), stream));
+                if (auto cuda_result = cudaMemsetAsync(level.solution, 0, level.count * sizeof(float), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
                 smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.solution, level.temporary, l == 0, false, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
                 smooth<<<(level.count + 255) / 256, 256, 0, stream>>>(grid, level, rhs, level.temporary, level.solution, l == 0, true, l + 1 < grid.layout.levels ? 3.f : 2.f, workspace.iteration);
                 auto coarse = workspace.levels[l + 1];
                 restrict_residual<<<(coarse.count + 255) / 256, 256, 0, stream>>>(grid, level, coarse, rhs, l == 0, workspace.iteration);
             }
         }
-        for (int l = workspace.levelCount - 2; l >= 0; --l) {
+        for (int l = workspace.level_count - 2; l >= 0; --l) {
             auto level       = workspace.levels[l];
             const float* rhs = l ? level.rhs : workspace.residual;
             prolongate<<<(level.count + 255) / 256, 256, 0, stream>>>(level, workspace.levels[l + 1], workspace.iteration);
@@ -384,10 +411,47 @@ namespace pyro::cuda::sparse {
     void component_sums(Grid grid, PressureWorkspace workspace, cudaStream_t stream) {
         if (!workspace.closed) return;
         int count = grid.layout.count * 512;
-        cuda_check(cudaMemsetAsync(workspace.componentSums, 0, count * sizeof(double), stream));
-        sum_closed_residual<<<(count + 255) / 256, 256, 0, stream>>>(count, workspace.residual, workspace.components, workspace.open, workspace.componentSums);
+        if (auto cuda_result = cudaMemsetAsync(workspace.component_sums, 0, count * sizeof(double), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        sum_closed_residual<<<(count + 255) / 256, 256, 0, stream>>>(count, workspace.residual, workspace.components, workspace.open, workspace.component_sums);
     }
-    __global__ void dot_blocks(Grid grid, const float* a, const float* b, double* partial, const IterationState* state, bool maximum, const double* componentSums = nullptr, const unsigned char* anchors = nullptr) {
+    __global__ void finish_dot(double* partial, int count, IterationState* state, int operation, float relative_tolerance, float absolute_tolerance) {
+        if (state->converged || state->failed) return;
+        __shared__ double sums[256], maxima[256];
+        double sum = 0.0, largest = 0.0;
+        for (int i = threadIdx.x; i < count; i += blockDim.x) {
+            sum += partial[i];
+            largest = fmax(largest, partial[count + i]);
+        }
+        sums[threadIdx.x]   = sum;
+        maxima[threadIdx.x] = largest;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+                maxima[threadIdx.x] = fmax(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x) return;
+        if (!isfinite(sums[0])) {
+            state->failed = 1;
+            return;
+        }
+        if (operation == 0) {
+            state->previous_rz = state->rz;
+            state->rz          = sums[0];
+        } else if (operation == 1) {
+            state->denominator = sums[0];
+            if (sums[0] <= 0.0) state->failed = 1;
+        } else {
+            if (operation == 2) state->initial_norm = sums[0];
+            state->max_residual = static_cast<float>(maxima[0]);
+            bool relative       = sums[0] <= state->initial_norm * relative_tolerance * relative_tolerance;
+            state->converged    = maxima[0] <= absolute_tolerance && (relative || maxima[0] <= absolute_tolerance * 0.1f);
+        }
+    }
+
+    __global__ void dot_blocks(Grid grid, const float* a, const float* b, double* partial, const IterationState* state, bool maximum, const double* component_sums = nullptr, const unsigned char* anchors = nullptr) {
         if (state->converged || state->failed) return;
         __shared__ double sums[256];
         __shared__ float maxima[256];
@@ -396,7 +460,7 @@ namespace pyro::cuda::sparse {
         float largest = 0;
         if (i < count && maximum) {
             float h = spacing(grid.layout, i);
-            largest = (anchors && anchors[i] ? float(fabs(componentSums[i])) : fabsf(a[i])) * grid.layout.h / (h * h * h);
+            largest = (anchors && anchors[i] ? float(fabs(component_sums[i])) : fabsf(a[i])) * grid.layout.h / (h * h * h);
         }
         sums[threadIdx.x]   = sum;
         maxima[threadIdx.x] = largest;
@@ -416,7 +480,7 @@ namespace pyro::cuda::sparse {
     __global__ void direction_kernel(PressureLevel fine, float* direction, const IterationState* state, bool first) {
         if (state->converged || state->failed) return;
         int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i < fine.count) direction[i] = fine.solution[i] + (first ? 0 : float(state->rz / state->previousRz) * direction[i]);
+        if (i < fine.count) direction[i] = fine.solution[i] + (first ? 0 : float(state->rz / state->previous_rz) * direction[i]);
     }
     template <typename T>
     __global__ void product_kernel(Grid grid, PressureLevel fine, const T* input, float* output, const IterationState* state, bool residual) {
@@ -439,11 +503,11 @@ namespace pyro::cuda::sparse {
         auto fine = workspace.levels[0];
         int count = (fine.count + 255) / 256;
         component_sums(grid, workspace, stream);
-        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.component_sums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressure_relative_tolerance, config.divergence_tolerance * .25f);
         precondition(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
         direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
     }
     void iterate_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
@@ -451,15 +515,15 @@ namespace pyro::cuda::sparse {
         int count = (fine.count + 255) / 256;
         product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.direction, workspace.product, workspace.iteration, false);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, false);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0, 0);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0, 0);
         update_kernel<<<count, 256, 0, stream>>>(fine.count, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.iteration);
         count_iteration<<<1, 1, 0, stream>>>(workspace.iteration);
         component_sums(grid, workspace, stream);
-        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .25f);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.component_sums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressure_relative_tolerance, config.divergence_tolerance * .25f);
         precondition(grid, workspace, stream);
         dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0, 0);
         direction_kernel<<<count, 256, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
     }
     void check_pressure(Grid grid, PressureWorkspace workspace, Config config, cudaStream_t stream) {
@@ -467,8 +531,8 @@ namespace pyro::cuda::sparse {
         int count = (fine.count + 255) / 256;
         product_kernel<<<count, 256, 0, stream>>>(grid, fine, workspace.solution, workspace.residual, workspace.iteration, true);
         component_sums(grid, workspace, stream);
-        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.componentSums : nullptr, workspace.closed ? workspace.anchors : nullptr);
-        finish_dot<256><<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * .5f);
+        dot_blocks<<<count, 256, 0, stream>>>(grid, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true, workspace.closed ? workspace.component_sums : nullptr, workspace.closed ? workspace.anchors : nullptr);
+        finish_dot<<<1, 256, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressure_relative_tolerance, config.divergence_tolerance * .5f);
     }
     __global__ void project_faces(Grid grid, Fields fields, const double* pressure) {
         int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -491,7 +555,7 @@ namespace pyro::cuda::sparse {
             fields.velocity[f] += float(difference / face.distance);
         } else if (face.area <= 0) {
             float h            = ldexpf(grid.layout.h, grid.layout.blocks[f / 1728].level);
-            fields.velocity[f] = face.solidFlux / (h * h);
+            fields.velocity[f] = face.solid_flux / (h * h);
         }
     }
     void apply_pressure(Grid grid, Fields fields, const double* pressure, cudaStream_t stream) {

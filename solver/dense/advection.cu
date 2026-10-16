@@ -1,33 +1,31 @@
 #include "cuda.cuh"
 
 namespace pyro::cuda::dense {
-    __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float endTime, float dt, bool obstacles, bool& clipped) {
+    __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float end_time, float dt, bool obstacles, bool& clipped) {
         Layout layout = grid.layout;
         clipped       = false;
         if (obstacles) {
-            float3 world   = grid.origin + p * h;
-            float distance = sample_boundary(grid, world, endTime, h);
+            float3 world{grid.origin.x + p.x * h, grid.origin.y + p.y * h, grid.origin.z + p.z * h};
+            float distance = sample_boundary(grid, world, end_time, h);
             if (distance < 0.01f * h) {
-                // A partially open face may have its MAC center inside the
-                // solid. Start its characteristic on the fluid side instead
-                // of freezing this sample at its own previous velocity.
                 float e = 0.25f * h;
-                float3 gradient{sample_boundary(grid, world + float3{e, 0, 0}, endTime, h) - sample_boundary(grid, world - float3{e, 0, 0}, endTime, h), sample_boundary(grid, world + float3{0, e, 0}, endTime, h) - sample_boundary(grid, world - float3{0, e, 0}, endTime, h), sample_boundary(grid, world + float3{0, 0, e}, endTime, h) - sample_boundary(grid, world - float3{0, 0, e}, endTime, h)};
-                p       = p + gradient * ((0.01f * h - distance) / (h * fmaxf(length(gradient), 1.0e-20f)));
-                clipped = true;
+                float3 gradient{sample_boundary(grid, {world.x + e, world.y, world.z}, end_time, h) - sample_boundary(grid, {world.x - e, world.y, world.z}, end_time, h), sample_boundary(grid, {world.x, world.y + e, world.z}, end_time, h) - sample_boundary(grid, {world.x, world.y - e, world.z}, end_time, h), sample_boundary(grid, {world.x, world.y, world.z + e}, end_time, h) - sample_boundary(grid, {world.x, world.y, world.z - e}, end_time, h)};
+                float scale = (0.01f * h - distance) / (h * fmaxf(sqrtf(gradient.x * gradient.x + gradient.y * gradient.y + gradient.z * gradient.z), 1.0e-20f));
+                p           = {p.x + gradient.x * scale, p.y + gradient.y * scale, p.z + gradient.z * scale};
+                clipped     = true;
             }
         }
-        float3 first     = sample_velocity(layout, carrier, p, wind);
-        float3 middle    = sample_velocity(layout, carrier, p - first * (0.5f * dt / h), wind);
-        float3 departure = p - middle * (dt / h);
+        float3 first  = sample_velocity(layout, carrier, p, wind);
+        float3 middle = sample_velocity(layout, carrier, {p.x - first.x * (0.5f * dt / h), p.y - first.y * (0.5f * dt / h), p.z - first.z * (0.5f * dt / h)}, wind);
+        float3 departure{p.x - middle.x * (dt / h), p.y - middle.y * (dt / h), p.z - middle.z * (dt / h)};
         if (!obstacles) return departure;
-        float bound = length(departure - p) * h + grid.colliderSpeed * fabsf(dt);
+        float3 delta{departure.x - p.x, departure.y - p.y, departure.z - p.z};
+        float bound = sqrtf(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) * h + grid.collider_speed * fabsf(dt);
         if (bound < 1.0e-12f) return departure;
         float fraction = 0.0f;
-        // Conservative advancement through the swept space-time SDF.
         for (int step = 0; step < 64; ++step) {
-            float3 position = p + (departure - p) * fraction;
-            float distance  = sample_boundary(grid, grid.origin + position * h, endTime - dt * fraction, h);
+            float3 position{p.x + delta.x * fraction, p.y + delta.y * fraction, p.z + delta.z * fraction};
+            float distance = sample_boundary(grid, {grid.origin.x + position.x * h, grid.origin.y + position.y * h, grid.origin.z + position.z * h}, end_time - dt * fraction, h);
             if (distance < 0.001f * h) {
                 clipped = true;
                 return position;
@@ -36,21 +34,21 @@ namespace pyro::cuda::dense {
             if (fraction >= 1.0f) return departure;
         }
         clipped = true;
-        return p + (departure - p) * fraction;
+        return {p.x + delta.x * fraction, p.y + delta.y * fraction, p.z + delta.z * fraction};
     }
 
     template <bool correct>
     __global__ void transport_velocity(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float time, float dt) {
         int id = static_cast<int>(blockIdx.x), axis = blockIdx.y;
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i         = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i         = id * tile_cells + local;
             float* output = destination.velocity[axis];
             if (!face_valid(grid.layout, cell_coordinate(grid.layout, i), axis)) {
-                output[i] = component(config.wind, axis);
+                output[i] = (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z);
                 continue;
             }
             if (grid.aperture[axis][i] == 0.0f) {
-                output[i] = grid.solidVelocity[axis][i];
+                output[i] = grid.solid_velocity[axis][i];
                 continue;
             }
             int3 c = cell_coordinate(grid.layout, i);
@@ -60,14 +58,14 @@ namespace pyro::cuda::dense {
             if (axis == 2) stagger.z = 0.0f;
             float3 p{c.x + stagger.x, c.y + stagger.y, c.z + stagger.z};
             const float* input = original.velocity[axis];
-            float background   = component(config.wind, axis);
+            float background   = (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z);
             bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, obstacles, clipped);
+            float3 departure = trace(grid, carrier, p, config.wind, config.cell_size, time + dt, dt, obstacles, clipped);
             float lo, hi;
-            float transported = sample(grid.layout, input, departure - stagger, background, &lo, &hi);
+            float transported = sample(grid.layout, input, {departure.x - stagger.x, departure.y - stagger.y, departure.z - stagger.z}, background, &lo, &hi);
             if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, obstacles, clipped);
-                if (!clipped) transported = fminf(hi, fmaxf(lo, transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], reverse - stagger, background))));
+                float3 reverse = trace(grid, carrier, p, config.wind, config.cell_size, time, -dt, obstacles, clipped);
+                if (!clipped) transported = fminf(hi, fmaxf(lo, transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], {reverse.x - stagger.x, reverse.y - stagger.y, reverse.z - stagger.z}, background))));
             }
             output[i] = transported;
         }
@@ -97,8 +95,8 @@ namespace pyro::cuda::dense {
     template <bool correct>
     __global__ void transport_scalars(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float time, float dt) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             if (!grid.fluid[i]) {
                 destination.smoke[i]       = 0.0f;
                 destination.temperature[i] = 0.0f;
@@ -107,13 +105,13 @@ namespace pyro::cuda::dense {
             int3 c = cell_coordinate(grid.layout, i);
             float3 stagger{0.5f, 0.5f, 0.5f}, p{c.x + 0.5f, c.y + 0.5f, c.z + 0.5f};
             bool clipped;
-            float3 departure = trace(grid, carrier, p, config.wind, config.cellSize, time + dt, dt, obstacles, clipped);
+            float3 departure = trace(grid, carrier, p, config.wind, config.cell_size, time + dt, dt, obstacles, clipped);
             float2 lo, hi;
-            float2 transported = sample_scalars(grid.layout, original, departure - stagger, &lo, &hi);
+            float2 transported = sample_scalars(grid.layout, original, {departure.x - stagger.x, departure.y - stagger.y, departure.z - stagger.z}, &lo, &hi);
             if (correct && !clipped) {
-                float3 reverse = trace(grid, carrier, p, config.wind, config.cellSize, time, -dt, obstacles, clipped);
+                float3 reverse = trace(grid, carrier, p, config.wind, config.cell_size, time, -dt, obstacles, clipped);
                 if (!clipped) {
-                    float2 backward = sample_scalars(grid.layout, grid.transported, reverse - stagger);
+                    float2 backward = sample_scalars(grid.layout, grid.transported, {reverse.x - stagger.x, reverse.y - stagger.y, reverse.z - stagger.z});
                     transported.x   = fminf(hi.x, fmaxf(lo.x, transported.x + 0.5f * (original.smoke[i] - backward.x)));
                     transported.y   = fminf(hi.y, fmaxf(lo.y, transported.y + 0.5f * (original.temperature[i] - backward.y)));
                 }
@@ -123,23 +121,23 @@ namespace pyro::cuda::dense {
         }
     }
 
-    __global__ void forces_kernel(Grid grid, Config config, Fields destination, Fields forceFields, float dt) {
-        float smokeDecay = expf(-0.5f * config.dissipation * dt);
-        float heatDecay  = expf(-0.5f * config.cooling * dt);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i                      = blockIdx.x * tileCells + local;
+    __global__ void forces_kernel(Grid grid, Config config, Fields destination, Fields force_fields, float dt) {
+        float smoke_decay = expf(-0.5f * config.dissipation * dt);
+        float heat_decay  = expf(-0.5f * config.cooling * dt);
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i                      = blockIdx.x * tile_cells + local;
             int3 c                     = cell_coordinate(grid.layout, i);
-            destination.smoke[i]       = grid.fluid[i] ? destination.smoke[i] * smokeDecay : 0;
-            destination.temperature[i] = grid.fluid[i] ? destination.temperature[i] * heatDecay : 0;
+            destination.smoke[i]       = grid.fluid[i] ? destination.smoke[i] * smoke_decay : 0;
+            destination.temperature[i] = grid.fluid[i] ? destination.temperature[i] * heat_decay : 0;
             for (int axis = 0; axis < 3; ++axis) {
                 if (!face_valid(grid.layout, c, axis)) {
-                    destination.velocity[axis][i] = component(config.wind, axis);
+                    destination.velocity[axis][i] = (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z);
                     continue;
                 }
                 int previous      = neighbor(grid.layout, i, axis, -1);
-                float density     = 0.5f * (forceFields.smoke[i] + value(forceFields.smoke, previous));
-                float temperature = 0.5f * (forceFields.temperature[i] + value(forceFields.temperature, previous));
-                destination.velocity[axis][i] += component(config.up, axis) * (config.buoyancy * temperature - config.smokeWeight * density) * dt;
+                float density     = 0.5f * (force_fields.smoke[i] + value(force_fields.smoke, previous));
+                float temperature = 0.5f * (force_fields.temperature[i] + value(force_fields.temperature, previous));
+                destination.velocity[axis][i] += (axis == 0 ? config.up.x : axis == 1 ? config.up.y : config.up.z) * (config.buoyancy * temperature - config.smoke_weight * density) * dt;
             }
         }
     }
@@ -149,54 +147,55 @@ namespace pyro::cuda::dense {
         int3 extent = region.extent;
         if (ordinal >= extent.x * extent.y * extent.z) return;
         int3 c{region.lower.x + ordinal % extent.x, region.lower.y + ordinal / extent.x % extent.y, region.lower.z + ordinal / (extent.x * extent.y)};
-        float3 p                    = grid.origin + float3{(c.x + .5f) * config.cellSize, (c.y + .5f) * config.cellSize, (c.z + .5f) * config.cellSize};
-        region.weights[ordinal * 4] = source_weight(sources[index], p, config.cellSize, sources[index].motion.time);
+        float3 p{grid.origin.x + (c.x + .5f) * config.cell_size, grid.origin.y + (c.y + .5f) * config.cell_size, grid.origin.z + (c.z + .5f) * config.cell_size};
+        region.weights[ordinal * 4] = source_weight(sources[index], p, config.cell_size, sources[index].motion.time);
         for (int axis = 0; axis < 3; ++axis) {
             float3 face = p;
-            if (axis == 0) face.x -= config.cellSize * .5f;
-            if (axis == 1) face.y -= config.cellSize * .5f;
-            if (axis == 2) face.z -= config.cellSize * .5f;
-            region.weights[ordinal * 4 + axis + 1] = source_weight(sources[index], face, config.cellSize, sources[index].motion.time);
+            if (axis == 0) face.x -= config.cell_size * .5f;
+            if (axis == 1) face.y -= config.cell_size * .5f;
+            if (axis == 2) face.z -= config.cell_size * .5f;
+            region.weights[ordinal * 4 + axis + 1] = source_weight(sources[index], face, config.cell_size, sources[index].motion.time);
         }
     }
 
     template <bool cached>
-    __global__ void source_kernel(Grid grid, Config config, Fields destination, const Source* sources, int sourceIndex, SourceRegion region, float time, float dt) {
+    __global__ void source_kernel(Grid grid, Config config, Fields destination, const Source* sources, int source_index, SourceRegion region, float time, float dt) {
         int3 lower = region.lower, extent = region.extent;
         int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
         if (ordinal >= extent.x * extent.y * extent.z) return;
-        Source source = sources[sourceIndex];
-        float overlap = fmaxf(0.0f, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
+        Source source = sources[source_index];
+        float overlap = fmaxf(0.0f, fminf(time + dt, source.end_time) - fmaxf(time, source.start_time));
         if (overlap == 0) return;
         int3 c{lower.x + ordinal % extent.x, lower.y + ordinal / extent.x % extent.y, lower.z + ordinal / (extent.x * extent.y)};
-        int i    = cell_index(grid.layout, c);
-        float3 p = grid.origin + float3{(c.x + 0.5f) * config.cellSize, (c.y + 0.5f) * config.cellSize, (c.z + 0.5f) * config.cellSize};
+        int i = cell_index(grid.layout, c);
+        float3 p{grid.origin.x + (c.x + 0.5f) * config.cell_size, grid.origin.y + (c.y + 0.5f) * config.cell_size, grid.origin.z + (c.z + 0.5f) * config.cell_size};
         if (grid.fluid[i]) {
-            float weight = (cached ? region.weights[ordinal * 4] : source_weight(source, p, config.cellSize, time + dt * 0.5f)) * overlap;
-            destination.smoke[i] += source.smokeRate * weight;
-            destination.temperature[i] += source.temperatureRate * weight;
+            float weight = (cached ? region.weights[ordinal * 4] : source_weight(source, p, config.cell_size, time + dt * 0.5f)) * overlap;
+            destination.smoke[i] += source.smoke_rate * weight;
+            destination.temperature[i] += source.temperature_rate * weight;
         }
         for (int axis = 0; axis < 3; ++axis) {
             if (!face_valid(grid.layout, c, axis)) continue;
             float3 face = p;
-            if (axis == 0) face.x -= config.cellSize * 0.5f;
-            if (axis == 1) face.y -= config.cellSize * 0.5f;
-            if (axis == 2) face.z -= config.cellSize * 0.5f;
-            float3 motionVelocity{};
-            float weight                  = cached ? region.weights[ordinal * 4 + axis + 1] : source_weight(source, face, config.cellSize, time + dt * 0.5f, &motionVelocity);
-            float blend                   = -expm1f(-source.velocityRate * weight * overlap);
+            if (axis == 0) face.x -= config.cell_size * 0.5f;
+            if (axis == 1) face.y -= config.cell_size * 0.5f;
+            if (axis == 2) face.z -= config.cell_size * 0.5f;
+            float3 motion_velocity{};
+            float weight                  = cached ? region.weights[ordinal * 4 + axis + 1] : source_weight(source, face, config.cell_size, time + dt * 0.5f, &motion_velocity);
+            float blend                   = -expm1f(-source.velocity_rate * weight * overlap);
             float velocity                = destination.velocity[axis][i];
-            destination.velocity[axis][i] = velocity + blend * (component(source.velocity + motionVelocity * source.inheritVelocity, axis) - velocity);
+            float target                  = axis == 0 ? source.velocity.x + motion_velocity.x * source.inherit_velocity : axis == 1 ? source.velocity.y + motion_velocity.y * source.inherit_velocity : source.velocity.z + motion_velocity.z * source.inherit_velocity;
+            destination.velocity[axis][i] = velocity + blend * (target - velocity);
         }
     }
 
     __global__ void decay_kernel(Config config, Fields destination, float dt) {
-        float smokeDecay = expf(-0.5f * config.dissipation * dt);
-        float heatDecay  = expf(-0.5f * config.cooling * dt);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = blockIdx.x * tileCells + local;
-            destination.smoke[i] *= smokeDecay;
-            destination.temperature[i] *= heatDecay;
+        float smoke_decay = expf(-0.5f * config.dissipation * dt);
+        float heat_decay  = expf(-0.5f * config.cooling * dt);
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = blockIdx.x * tile_cells + local;
+            destination.smoke[i] *= smoke_decay;
+            destination.temperature[i] *= heat_decay;
         }
     }
 
@@ -205,10 +204,10 @@ namespace pyro::cuda::dense {
         __shared__ double sums[6][threads];
         double values[6]{};
         int id       = static_cast<int>(blockIdx.x);
-        float volume = config.cellSize * config.cellSize * config.cellSize;
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i       = id * tileCells + local;
-            float speed = length({fields.velocity[0][i], fields.velocity[1][i], fields.velocity[2][i]});
+        float volume = config.cell_size * config.cell_size * config.cell_size;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i       = id * tile_cells + local;
+            float speed = sqrtf(fields.velocity[0][i] * fields.velocity[0][i] + fields.velocity[1][i] * fields.velocity[1][i] + fields.velocity[2][i] * fields.velocity[2][i]);
             values[2]   = fmax(values[2], static_cast<double>(isfinite(speed) ? speed : INFINITY));
             if (!grid.fluid[i]) continue;
             if constexpr (full) {
@@ -216,15 +215,15 @@ namespace pyro::cuda::dense {
                 for (int axis = 0; axis < 3; ++axis) {
                     int right = neighbor(grid.layout, i, axis, 1);
                     float a = grid.aperture[axis][i], b = value(grid.aperture[axis], right, 1.0f);
-                    divergence += b * value(fields.velocity[axis], right, component(config.wind, axis)) + (1.0f - b) * value(grid.solidVelocity[axis], right) - a * fields.velocity[axis][i] - (1.0f - a) * grid.solidVelocity[axis][i];
+                    divergence += b * value(fields.velocity[axis], right, (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z)) + (1.0f - b) * value(grid.solid_velocity[axis], right) - a * fields.velocity[axis][i] - (1.0f - a) * grid.solid_velocity[axis][i];
                 }
-                divergence = divergence / config.cellSize - grid.solidDivergence[i];
+                divergence = divergence / config.cell_size - grid.solid_divergence[i];
                 values[0] += 1.0;
                 values[1] = fmax(values[1], static_cast<double>(isfinite(divergence) ? fabsf(divergence) : INFINITY));
                 values[3] += fields.smoke[i] * volume;
                 values[4] += fields.temperature[i] * volume;
             }
-            values[5] = fmax(values[5], static_cast<double>(fabsf(config.buoyancy * fields.temperature[i] - config.smokeWeight * fields.smoke[i]) * length(config.up)));
+            values[5] = fmax(values[5], static_cast<double>(fabsf(config.buoyancy * fields.temperature[i] - config.smoke_weight * fields.smoke[i]) * sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z)));
         }
         for (int k = 0; k < 6; ++k) sums[k][threadIdx.x] = values[k];
         __syncthreads();
@@ -240,7 +239,7 @@ namespace pyro::cuda::dense {
             for (int k = 0; k < 6; ++k) partial[6 * blockIdx.x + k] = sums[k][0];
     }
 
-    __global__ void finish_statistics(int count, Config config, const Source* sources, int sourceCount, float colliderSpeed, float time, double* partial, float* maximum) {
+    __global__ void finish_statistics(int count, Config config, const Source* sources, int source_count, float collider_speed, float time, double* partial, float* maximum) {
         __shared__ double sums[6][threads];
         double values[6]{};
         for (int i = threadIdx.x; i < count; i += blockDim.x)
@@ -261,24 +260,24 @@ namespace pyro::cuda::dense {
         if (threadIdx.x) return;
         for (int k = 0; k < 6; ++k) values[k] = sums[k][0];
         for (int k = 0; k < 6; ++k) partial[count * 6ull + k] = values[k];
-        float speed = fmaxf(static_cast<float>(values[2]), length(config.wind)), acceleration = static_cast<float>(values[5]);
-        for (int i = 0; i < sourceCount; ++i) {
+        float speed = fmaxf(static_cast<float>(values[2]), sqrtf(config.wind.x * config.wind.x + config.wind.y * config.wind.y + config.wind.z * config.wind.z)), acceleration = static_cast<float>(values[5]);
+        for (int i = 0; i < source_count; ++i) {
             Source source = sources[i];
-            if (time >= source.endTime || time + config.maxTimeStep < source.startTime) continue;
-            speed = fmaxf(speed, length(source.velocity) + source.motion.maxSpeed * fmaxf(1.0f, source.inheritVelocity));
-            acceleration += (fabsf(config.buoyancy * source.temperatureRate) + fabsf(config.smokeWeight * source.smokeRate)) * config.maxTimeStep * length(config.up);
+            if (time >= source.end_time || time + config.max_time_step < source.start_time) continue;
+            speed = fmaxf(speed, sqrtf(source.velocity.x * source.velocity.x + source.velocity.y * source.velocity.y + source.velocity.z * source.velocity.z) + source.motion.max_speed * fmaxf(1.0f, source.inherit_velocity));
+            acceleration += (fabsf(config.buoyancy * source.temperature_rate) + fabsf(config.smoke_weight * source.smoke_rate)) * config.max_time_step * sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z);
         }
-        speed      = fmaxf(speed, colliderSpeed);
+        speed      = fmaxf(speed, collider_speed);
         maximum[0] = speed;
         maximum[1] = acceleration;
     }
 
-    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float startTime, float dt, cudaStream_t stream) {
-        dim3 velocityBlocks(grid.layout.blocks, 3);
-        transport_velocity<false><<<velocityBlocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, startTime, dt);
-        transport_scalars<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, startTime, dt);
-        transport_velocity<true><<<velocityBlocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, startTime, dt);
-        transport_scalars<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, startTime, dt);
+    void advect(Grid grid, Config config, Fields destination, Fields original, Fields carrier, bool obstacles, float start_time, float dt, cudaStream_t stream) {
+        dim3 velocity_blocks(grid.layout.blocks, 3);
+        transport_velocity<false><<<velocity_blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, start_time, dt);
+        transport_scalars<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, grid.transported, original, carrier, obstacles, start_time, dt);
+        transport_velocity<true><<<velocity_blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, start_time, dt);
+        transport_scalars<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, original, carrier, obstacles, start_time, dt);
     }
 
     void cache_source(Grid grid, Config config, const Source* sources, int index, SourceRegion region, cudaStream_t stream) {
@@ -286,8 +285,8 @@ namespace pyro::cuda::dense {
         if (cells) cache_source_kernel<<<(cells + threads - 1) / threads, threads, 0, stream>>>(grid, config, sources, index, region);
     }
 
-    void apply_sources_forces(Grid grid, Config config, Fields destination, Fields forceFields, const Source* sources, const SourceRegion* regions, int count, float time, float dt, cudaStream_t stream) {
-        forces_kernel<<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, forceFields, dt);
+    void apply_sources_forces(Grid grid, Config config, Fields destination, Fields force_fields, const Source* sources, const SourceRegion* regions, int count, float time, float dt, cudaStream_t stream) {
+        forces_kernel<<<grid.layout.blocks, threads, 0, stream>>>(grid, config, destination, force_fields, dt);
         for (int source = 0; source < count; ++source) {
             auto region = regions[source];
             int cells   = region.extent.x * region.extent.y * region.extent.z;
@@ -298,9 +297,9 @@ namespace pyro::cuda::dense {
         decay_kernel<<<grid.layout.blocks, threads, 0, stream>>>(config, destination, dt);
     }
 
-    void measure(Grid grid, Fields fields, Config config, const Source* sources, int sourceCount, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {
+    void measure(Grid grid, Fields fields, Config config, const Source* sources, int source_count, float time, double* reductions, float* maximum, bool full, cudaStream_t stream) {
         if (full) statistics_kernel<true><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
         else statistics_kernel<false><<<grid.layout.blocks, threads, 0, stream>>>(grid, fields, config, reductions);
-        finish_statistics<<<1, threads, 0, stream>>>(grid.layout.blocks, config, sources, sourceCount, grid.colliderSpeed, time, reductions, maximum);
+        finish_statistics<<<1, threads, 0, stream>>>(grid.layout.blocks, config, sources, source_count, grid.collider_speed, time, reductions, maximum);
     }
 } // namespace pyro::cuda::dense

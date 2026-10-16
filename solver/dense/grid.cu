@@ -1,33 +1,33 @@
 #include "cuda.cuh"
 namespace pyro::cuda::dense {
     __global__ void clear_geometry(Grid grid, float h, int sample) {
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) grid.distance[sample][blockIdx.x * tileCells + local] = 4 * h;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) grid.distance[sample][blockIdx.x * tile_cells + local] = 4 * h;
     }
     __global__ void clear_boundary(Grid grid) {
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i                   = blockIdx.x * tileCells + local;
-            grid.fluid[i]           = interior(grid.layout, cell_coordinate(grid.layout, i));
-            grid.solidDivergence[i] = 0;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i                    = blockIdx.x * tile_cells + local;
+            grid.fluid[i]            = interior(grid.layout, cell_coordinate(grid.layout, i));
+            grid.solid_divergence[i] = 0;
             for (int axis = 0; axis < 3; ++axis) {
-                grid.aperture[axis][i]      = 1;
-                grid.solidVelocity[axis][i] = 0;
+                grid.aperture[axis][i]       = 1;
+                grid.solid_velocity[axis][i] = 0;
             }
         }
     }
     __global__ void geometry_kernel(Grid grid, float h, const Collider* colliders, int count, float time, int sample) {
         int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-        int3 extent = grid.geometryExtent;
+        int3 extent = grid.geometry_extent;
         if (ordinal >= extent.x * extent.y * extent.z) return;
-        int3 cell{grid.geometryLower.x + ordinal % extent.x, grid.geometryLower.y + ordinal / extent.x % extent.y, grid.geometryLower.z + ordinal / (extent.x * extent.y)};
+        int3 cell{grid.geometry_lower.x + ordinal % extent.x, grid.geometry_lower.y + ordinal / extent.x % extent.y, grid.geometry_lower.z + ordinal / (extent.x * extent.y)};
         int index                    = cell_index(grid.layout, cell);
-        grid.distance[sample][index] = fminf(4.0f * h, fmaxf(-4.0f * h, solid_distance(grid.origin + float3{cell.x * h, cell.y * h, cell.z * h}, time, colliders, count)));
+        grid.distance[sample][index] = fminf(4.0f * h, fmaxf(-4.0f * h, solid_distance({grid.origin.x + cell.x * h, grid.origin.y + cell.y * h, grid.origin.z + cell.z * h}, time, colliders, count)));
     }
 
     __global__ void boundary_kernel(Grid grid, float h, const Collider* colliders, int count, float time, int sample) {
         int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-        int3 extent = grid.geometryExtent;
+        int3 extent = grid.geometry_extent;
         if (ordinal >= extent.x * extent.y * extent.z) return;
-        int3 cell{grid.geometryLower.x + ordinal % extent.x, grid.geometryLower.y + ordinal / extent.x % extent.y, grid.geometryLower.z + ordinal / (extent.x * extent.y)};
+        int3 cell{grid.geometry_lower.x + ordinal % extent.x, grid.geometry_lower.y + ordinal / extent.x % extent.y, grid.geometry_lower.z + ordinal / (extent.x * extent.y)};
         int index = cell_index(grid.layout, cell);
         float phi[8], maximum = -1.0e20f;
         for (int k = 0; k < 8; ++k) {
@@ -37,8 +37,8 @@ namespace pyro::cuda::dense {
         grid.fluid[index] = interior(grid.layout, cell) && maximum > 0.0f;
         float volume      = (tetrahedron_fraction(phi[0], phi[1], phi[3], phi[7]) + tetrahedron_fraction(phi[0], phi[3], phi[2], phi[7]) + tetrahedron_fraction(phi[0], phi[2], phi[6], phi[7]) + tetrahedron_fraction(phi[0], phi[6], phi[4], phi[7]) + tetrahedron_fraction(phi[0], phi[4], phi[5], phi[7]) + tetrahedron_fraction(phi[0], phi[5], phi[1], phi[7])) / 6.0f;
         float divergence  = 0;
-        if (volume < 1.0f) solid_distance(grid.origin + float3{(cell.x + 0.5f) * h, (cell.y + 0.5f) * h, (cell.z + 0.5f) * h}, time, colliders, count, nullptr, &divergence);
-        grid.solidDivergence[index] = (1.0f - volume) * divergence;
+        if (volume < 1.0f) solid_distance({grid.origin.x + (cell.x + 0.5f) * h, grid.origin.y + (cell.y + 0.5f) * h, grid.origin.z + (cell.z + 0.5f) * h}, time, colliders, count, nullptr, &divergence);
+        grid.solid_divergence[index] = (1.0f - volume) * divergence;
         for (int axis = 0; axis < 3; ++axis) {
             int b = 1 << ((axis + 1) % 3), c = 1 << ((axis + 2) % 3);
             grid.aperture[axis][index] = 0.5f * (triangle_fraction(phi[0], phi[b], phi[b | c]) + triangle_fraction(phi[0], phi[b | c], phi[c]));
@@ -50,23 +50,26 @@ namespace pyro::cuda::dense {
             if (covered > 0.0f && covered < 1.0f) {
                 float3 y{float(b & 1), float((b >> 1) & 1), float((b >> 2) & 1)};
                 float3 z{float(c & 1), float((c >> 1) & 1), float((c >> 2) & 1)};
-                float3 moment = (solid_face_moment(phi[0], phi[b], phi[b | c], {}, y, y + z) + solid_face_moment(phi[0], phi[b | c], phi[c], {}, y + z, z)) * 0.5f;
-                p             = float3{float(cell.x), float(cell.y), float(cell.z)} + moment / covered;
+                float3 corner{y.x + z.x, y.y + z.y, y.z + z.z};
+                float3 first = solid_face_moment(phi[0], phi[b], phi[b | c], {}, y, corner), second = solid_face_moment(phi[0], phi[b | c], phi[c], {}, corner, z);
+                float3 moment{(first.x + second.x) * 0.5f, (first.y + second.y) * 0.5f, (first.z + second.z) * 0.5f};
+                float inverse_covered = 1.0f / covered;
+                p                     = {float(cell.x) + moment.x * inverse_covered, float(cell.y) + moment.y * inverse_covered, float(cell.z) + moment.z * inverse_covered};
             }
             float3 velocity{};
-            if (covered > 0.0f) solid_distance(grid.origin + p * h, time, colliders, count, &velocity);
-            grid.solidVelocity[axis][index] = component(velocity, axis);
+            if (covered > 0.0f) solid_distance({grid.origin.x + p.x * h, grid.origin.y + p.y * h, grid.origin.z + p.z * h}, time, colliders, count, &velocity);
+            grid.solid_velocity[axis][index] = (axis == 0 ? velocity.x : axis == 1 ? velocity.y : velocity.z);
         }
     }
 
     __global__ void initialize_kernel(Grid grid, float3 wind) {
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = blockIdx.x * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = blockIdx.x * tile_cells + local;
             Fields fields[]{grid.state, grid.midpoint, grid.next, grid.transported};
             for (auto field : fields) {
                 field.smoke[i]       = 0;
                 field.temperature[i] = 0;
-                for (int axis = 0; axis < 3; ++axis) field.velocity[axis][i] = component(wind, axis);
+                for (int axis = 0; axis < 3; ++axis) field.velocity[axis][i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
             }
         }
     }
@@ -75,12 +78,12 @@ namespace pyro::cuda::dense {
     }
     void sample_geometry(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream) {
         clear_geometry<<<grid.layout.blocks, threads, 0, stream>>>(grid, h, sample);
-        int cells = grid.geometryExtent.x * grid.geometryExtent.y * grid.geometryExtent.z;
+        int cells = grid.geometry_extent.x * grid.geometry_extent.y * grid.geometry_extent.z;
         if (cells) geometry_kernel<<<(cells + threads - 1) / threads, threads, 0, stream>>>(grid, h, colliders, count, time, sample);
     }
     void update_boundary(Grid grid, float h, const Collider* colliders, int count, float time, int sample, cudaStream_t stream) {
         clear_boundary<<<grid.layout.blocks, threads, 0, stream>>>(grid);
-        int cells = grid.geometryExtent.x * grid.geometryExtent.y * grid.geometryExtent.z;
+        int cells = grid.geometry_extent.x * grid.geometry_extent.y * grid.geometry_extent.z;
         if (cells) boundary_kernel<<<(cells + threads - 1) / threads, threads, 0, stream>>>(grid, h, colliders, count, time, sample);
     }
 } // namespace pyro::cuda::dense

@@ -5,28 +5,28 @@ export import pyro.types;
 import std;
 export namespace pyro::dense {
     struct Config {
-        float cellSize{0.05f};
+        float cell_size{0.05f};
         std::array<float, 3> origin{-3.2f, -0.8f, -3.2f};
         std::array<int, 3> resolution{128, 192, 128};
         float cfl{0.75f};
-        float maxTimeStep{1.0f / 48.0f};
+        float max_time_step{1.0f / 48.0f};
         float buoyancy{1.0f};
-        float smokeWeight{0.05f};
+        float smoke_weight{0.05f};
         std::array<float, 3> up{0.0f, 1.0f, 0.0f};
         std::array<float, 3> wind{};
         float cooling{0.1f};
         float dissipation{0.01f};
-        float pressureRelativeTolerance{1.0e-5f};
-        float divergenceTolerance{2.0e-4f}; // Absolute max divergence, in inverse seconds.
-        int pressureMaxIterations{200};
+        float pressure_relative_tolerance{1.0e-5f};
+        float divergence_tolerance{2.0e-4f};
+        int pressure_max_iterations{200};
     };
 
     struct Statistics {
-        int fluidCells{}, substeps{}, pressureIterations{}, pressureLevels{};
-        float maxDivergence{}, maxSpeed{}, stepMilliseconds{};
-        float geometryMilliseconds{}, advectionMilliseconds{}, forcesMilliseconds{}, projectionMilliseconds{}, statisticsMilliseconds{};
-        double smokeIntegral{}, temperatureIntegral{};
-        unsigned long long allocatedBytes{};
+        int fluid_cells{}, substeps{}, pressure_iterations{}, pressure_levels{};
+        float max_divergence{}, max_speed{}, step_milliseconds{};
+        float geometry_milliseconds{}, advection_milliseconds{}, forces_milliseconds{}, projection_milliseconds{}, statistics_milliseconds{};
+        double smoke_integral{}, temperature_integral{};
+        unsigned long long allocated_bytes{};
     };
     struct Solver {
         const Config config;
@@ -42,7 +42,6 @@ export namespace pyro::dense {
         int add_mesh(std::span<const Triangle> triangles);
         void advance(double duration);
         void synchronize();
-        // Restore into the same domain/configuration; scene inputs remain caller-owned.
         void checkpoint(const char* path, bool restore);
         std::span<const float> download_density();
 
@@ -53,12 +52,12 @@ export namespace pyro::dense {
         cuda::dense::PressureWorkspace pressure;
         cuda::Source* sources{};
         cuda::Collider* colliders{};
-        int sourceCount{}, colliderCount{}, sourceCapacity{}, colliderCapacity{};
+        int source_count{}, collider_count{}, source_capacity{}, collider_capacity{};
         std::vector<cuda::Mesh> meshes;
-        std::vector<cuda::dense::SourceRegion> sourceRegions;
-        std::vector<Source> sourceInputs;
-        std::vector<Collider> colliderInputs;
-        bool geometryDirty{true}, matrixDirty{true};
+        std::vector<cuda::dense::SourceRegion> source_regions;
+        std::vector<Source> source_inputs;
+        std::vector<Collider> collider_inputs;
+        bool geometry_dirty{true}, matrix_dirty{true};
         float* maximum{};
         std::vector<float> density;
         cudaEvent_t events[9]{};

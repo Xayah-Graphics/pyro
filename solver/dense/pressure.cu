@@ -2,8 +2,6 @@
 
 namespace pyro::cuda::dense {
     __device__ float matrix_product(PressureLevel level, const float* x, int i) {
-        // Flux differences preserve the constant nullspace in FP32. Expanding
-        // diag*x - sum(face*x_neighbor) loses accuracy for smooth pressures.
         if (level.diagonal[i] <= 0.0f) return 0.0f;
         float result = level.boundary[i] * x[i];
         for (int axis = 0; axis < 3; ++axis) {
@@ -18,10 +16,10 @@ namespace pyro::cuda::dense {
     __global__ void assemble_fine(Grid grid, Fields fields, PressureLevel level, float h, int* parents, int* open, unsigned char* anchors, float* solution, float* residual) {
         int id      = static_cast<int>(blockIdx.x);
         float scale = 1.0f / (h * h);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i          = id * tileCells + local;
-            float diagonal = 0.0f, boundary = 0.0f, divergence = -grid.solidDivergence[i];
-            bool isOpen = false;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i          = id * tile_cells + local;
+            float diagonal = 0.0f, boundary = 0.0f, divergence = -grid.solid_divergence[i];
+            bool is_open = false;
             if constexpr (rebuild) {
                 parents[i] = i;
                 open[i]    = 0;
@@ -32,18 +30,18 @@ namespace pyro::cuda::dense {
                 int previous = neighbor(grid.layout, i, axis, -1);
                 if constexpr (rebuild) level.face[axis][i] = grid.fluid[i] && previous >= 0 && grid.fluid[previous] ? grid.aperture[axis][i] * scale : 0.0f;
                 for (int sign = -1; sign <= 1; sign += 2) {
-                    int adjacent        = neighbor(grid.layout, i, axis, sign);
-                    int face            = sign < 0 ? i : adjacent;
-                    float aperture      = value(grid.aperture[axis], face, 1.0f);
-                    float fluidVelocity = value(fields.velocity[axis], face);
-                    float solidVelocity = value(grid.solidVelocity[axis], face);
-                    divergence += sign * (aperture * fluidVelocity + (1.0f - aperture) * solidVelocity) / h;
+                    int adjacent         = neighbor(grid.layout, i, axis, sign);
+                    int face             = sign < 0 ? i : adjacent;
+                    float aperture       = value(grid.aperture[axis], face, 1.0f);
+                    float fluid_velocity = value(fields.velocity[axis], face);
+                    float solid_velocity = value(grid.solid_velocity[axis], face);
+                    divergence += sign * (aperture * fluid_velocity + (1.0f - aperture) * solid_velocity) / h;
                     if constexpr (rebuild) {
                         if (adjacent >= 0 && grid.fluid[adjacent]) diagonal += aperture * scale;
                         else if (adjacent < 0 || !interior(grid.layout, cell_coordinate(grid.layout, adjacent))) {
                             diagonal += 2.0f * aperture * scale;
                             boundary += 2.0f * aperture * scale;
-                            isOpen = isOpen || aperture > 0.0f;
+                            is_open = is_open || aperture > 0.0f;
                         }
                     }
                 }
@@ -51,7 +49,7 @@ namespace pyro::cuda::dense {
             if constexpr (rebuild) {
                 level.diagonal[i]  = grid.fluid[i] ? diagonal : 0.0f;
                 level.boundary[i]  = grid.fluid[i] ? boundary : 0.0f;
-                level.temporary[i] = isOpen && grid.fluid[i] ? 1.0f : 0.0f;
+                level.temporary[i] = is_open && grid.fluid[i] ? 1.0f : 0.0f;
             }
             level.rhs[i] = grid.fluid[i] && !anchors[i] ? -divergence : 0.0f;
             residual[i]  = level.rhs[i];
@@ -60,19 +58,47 @@ namespace pyro::cuda::dense {
 
     __global__ void connect_components(PressureLevel level, const unsigned char* fluid, int* parents) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             if (!fluid[i]) continue;
             for (int axis = 0; axis < 3; ++axis) {
                 if (level.face[axis][i] <= 0.0f) continue;
                 int j = neighbor(level.layout, i, axis, -1);
-                int a = component_root(parents, i), b = component_root(parents, j);
+                int a = i, b = j;
+                int parent = atomicAdd(parents + a, 0);
+                while (parent != a) {
+                    int next = atomicAdd(parents + parent, 0);
+                    atomicMin(parents + a, next);
+                    a      = parent;
+                    parent = next;
+                }
+                parent = atomicAdd(parents + b, 0);
+                while (parent != b) {
+                    int next = atomicAdd(parents + parent, 0);
+                    atomicMin(parents + b, next);
+                    b      = parent;
+                    parent = next;
+                }
                 while (a != b) {
                     int high = max(a, b), low = min(a, b);
                     int old = atomicCAS(parents + high, high, low);
                     if (old == high) break;
-                    a = component_root(parents, old);
-                    b = component_root(parents, low);
+                    a      = old;
+                    parent = atomicAdd(parents + a, 0);
+                    while (parent != a) {
+                        int next = atomicAdd(parents + parent, 0);
+                        atomicMin(parents + a, next);
+                        a      = parent;
+                        parent = next;
+                    }
+                    b      = low;
+                    parent = atomicAdd(parents + b, 0);
+                    while (parent != b) {
+                        int next = atomicAdd(parents + parent, 0);
+                        atomicMin(parents + b, next);
+                        b      = parent;
+                        parent = next;
+                    }
                 }
             }
         }
@@ -80,9 +106,15 @@ namespace pyro::cuda::dense {
 
     __global__ void mark_components(PressureLevel level, int* parents, int* open) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
-            int r = component_root(parents, i);
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
+            int r = i, parent = atomicAdd(parents + r, 0);
+            while (parent != r) {
+                int next = atomicAdd(parents + parent, 0);
+                atomicMin(parents + r, next);
+                r      = parent;
+                parent = next;
+            }
             atomicExch(parents + i, r);
             if (level.temporary[i] > 0.0f) atomicExch(open + r, 1);
         }
@@ -90,8 +122,8 @@ namespace pyro::cuda::dense {
 
     __global__ void anchor_components(PressureLevel level, const unsigned char* fluid, int* parents, const int* open, unsigned char* anchors, float* residual) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i       = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i       = id * tile_cells + local;
             int r       = parents[i];
             bool anchor = fluid[i] && !open[r] && r == i;
             anchors[i]  = anchor;
@@ -106,8 +138,8 @@ namespace pyro::cuda::dense {
 
     __global__ void anchor_faces(PressureLevel level, const unsigned char* anchors) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             for (int axis = 0; axis < 3; ++axis) {
                 int j = neighbor(level.layout, i, axis, -1);
                 if (anchors[i] || (j >= 0 && anchors[j])) {
@@ -122,8 +154,8 @@ namespace pyro::cuda::dense {
 
     __global__ void coarsen_matrix(PressureLevel fine, PressureLevel coarse) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i  = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i  = id * tile_cells + local;
             int3 c = cell_coordinate(coarse.layout, i);
             if (!interior(coarse.layout, c)) {
                 coarse.diagonal[i] = coarse.boundary[i] = 0;
@@ -132,8 +164,6 @@ namespace pyro::cuda::dense {
             }
             float diagonal = 0.0f, boundary = 0.0f;
             float faces[3]{};
-            // P is piecewise constant, R = transpose(P). Sum only external
-            // faces; do not subtract large internal diagonal contributions.
             for (int z = 0; z < fine.coarsening.z; ++z)
                 for (int y = 0; y < fine.coarsening.y; ++y)
                     for (int x = 0; x < fine.coarsening.x; ++x) {
@@ -158,14 +188,12 @@ namespace pyro::cuda::dense {
         }
     }
 
-    // Fixed degree-two Chebyshev polynomial on [0.3, 2] for D^-1 A.
-    // Matching pre/post polynomials keep the V-cycle symmetric for PCG.
     template <bool zero>
     __global__ void chebyshev_first(PressureLevel level, const float* rhs, const IterationState* state) {
         if (state->converged || state->failed) return;
         constexpr float theta = 1.15f;
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i              = blockIdx.x * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i              = blockIdx.x * tile_cells + local;
             float d            = level.diagonal[i];
             float x            = zero ? 0 : level.solution[i];
             float r            = zero ? rhs[i] : rhs[i] - matrix_product(level, level.solution, i);
@@ -177,10 +205,10 @@ namespace pyro::cuda::dense {
     __global__ void chebyshev_second(PressureLevel level, const float* rhs, const IterationState* state) {
         if (state->converged || state->failed) return;
         constexpr float theta = 1.15f, delta = .85f;
-        constexpr float rho = delta / theta, nextRho = 1 / (2 * theta / delta - rho);
-        constexpr float alpha = 2 * nextRho / delta, beta = rho * nextRho;
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i             = blockIdx.x * tileCells + local;
+        constexpr float rho = delta / theta, next_rho = 1 / (2 * theta / delta - rho);
+        constexpr float alpha = 2 * next_rho / delta, beta = rho * next_rho;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i             = blockIdx.x * tile_cells + local;
             float d           = level.diagonal[i];
             float old         = zero ? 0 : level.solution[i];
             float x           = level.temporary[i];
@@ -192,8 +220,8 @@ namespace pyro::cuda::dense {
     __global__ void restrict_residual(PressureLevel fine, PressureLevel coarse, const float* rhs, const IterationState* state) {
         if (state->converged || state->failed) return;
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i  = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i  = id * tile_cells + local;
             int3 c = cell_coordinate(coarse.layout, i);
             if (!interior(coarse.layout, c)) {
                 coarse.rhs[i] = 0;
@@ -215,8 +243,8 @@ namespace pyro::cuda::dense {
     __global__ void prolongate(PressureLevel fine, PressureLevel coarse, const IterationState* state) {
         if (state->converged || state->failed) return;
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i  = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i  = id * tile_cells + local;
             int3 c = cell_coordinate(fine.layout, i);
             if (fine.diagonal[i] > 0.0f) fine.solution[i] += value(coarse.solution, cell_index(coarse.layout, {c.x / fine.coarsening.x, c.y / fine.coarsening.y, c.z / fine.coarsening.z}));
         }
@@ -224,8 +252,6 @@ namespace pyro::cuda::dense {
 
     __global__ void solve_coarsest(PressureLevel level, const float* rhs, const IterationState* state) {
         if (state->converged || state->failed) return;
-        // The coarsest physical grid has at most 512 cells; keep its whole
-        // stencil in shared memory instead of repeatedly loading padded planes.
         __shared__ float x[512], b[512], diagonal[512], boundary[512], face[3][512];
         int nx = level.layout.size.x, ny = level.layout.size.y, nz = level.layout.size.z;
         int count = nx * ny * nz;
@@ -263,6 +289,43 @@ namespace pyro::cuda::dense {
         }
     }
 
+    __global__ void finish_dot(double* partial, int count, IterationState* state, int operation, float relative_tolerance, float absolute_tolerance) {
+        if (state->converged || state->failed) return;
+        __shared__ double sums[threads], maxima[threads];
+        double sum = 0.0, largest = 0.0;
+        for (int i = threadIdx.x; i < count; i += blockDim.x) {
+            sum += partial[i];
+            largest = fmax(largest, partial[count + i]);
+        }
+        sums[threadIdx.x]   = sum;
+        maxima[threadIdx.x] = largest;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums[threadIdx.x] += sums[threadIdx.x + stride];
+                maxima[threadIdx.x] = fmax(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x) return;
+        if (!isfinite(sums[0])) {
+            state->failed = 1;
+            return;
+        }
+        if (operation == 0) {
+            state->previous_rz = state->rz;
+            state->rz          = sums[0];
+        } else if (operation == 1) {
+            state->denominator = sums[0];
+            if (sums[0] <= 0.0) state->failed = 1;
+        } else {
+            if (operation == 2) state->initial_norm = sums[0];
+            state->max_residual = static_cast<float>(maxima[0]);
+            bool relative       = sums[0] <= state->initial_norm * relative_tolerance * relative_tolerance;
+            state->converged    = maxima[0] <= absolute_tolerance && (relative || maxima[0] <= absolute_tolerance * 0.1f);
+        }
+    }
+
     __global__ void dot_blocks(PressureLevel level, const float* a, const float* b, double* partial, const IterationState* state, bool maximum) {
         if (state->converged || state->failed) return;
         __shared__ double sums[threads];
@@ -270,8 +333,8 @@ namespace pyro::cuda::dense {
         int id        = static_cast<int>(blockIdx.x);
         double sum    = 0.0;
         float largest = 0.0f;
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             sum += static_cast<double>(a[i]) * static_cast<double>(b[i]);
             if (maximum) largest = fmaxf(largest, fabsf(a[i]));
         }
@@ -294,9 +357,9 @@ namespace pyro::cuda::dense {
     __global__ void search_direction(PressureLevel level, float* direction, const IterationState* state, bool first) {
         if (state->converged || state->failed) return;
         int id     = static_cast<int>(blockIdx.x);
-        float beta = first ? 0.0f : static_cast<float>(state->rz / state->previousRz);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i        = id * tileCells + local;
+        float beta = first ? 0.0f : static_cast<float>(state->rz / state->previous_rz);
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i        = id * tile_cells + local;
             direction[i] = first ? level.solution[i] : level.solution[i] + beta * direction[i];
         }
     }
@@ -306,8 +369,8 @@ namespace pyro::cuda::dense {
         __shared__ double sums[threads];
         double sum = 0.0;
         int id     = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i        = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i        = id * tile_cells + local;
             float result = matrix_product(level, direction, i);
             product[i]   = result;
             sum += static_cast<double>(direction[i]) * static_cast<double>(result);
@@ -332,8 +395,8 @@ namespace pyro::cuda::dense {
         float largest = 0.0f;
         int id        = static_cast<int>(blockIdx.x);
         float alpha   = static_cast<float>(state->rz / state->denominator);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             solution[i] += alpha * direction[i];
             float r     = residual[i] - alpha * product[i];
             residual[i] = r;
@@ -354,7 +417,6 @@ namespace pyro::cuda::dense {
             partial[blockIdx.x]                       = sums[0];
             partial[level.layout.blocks + blockIdx.x] = maxima[0];
         }
-        // Iteration count is advanced in a separate kernel to avoid a cross-CTA race.
     }
 
     __global__ void count_iteration(IterationState* state) {
@@ -363,48 +425,48 @@ namespace pyro::cuda::dense {
 
     __global__ void true_residual(PressureLevel level, const float* solution, float* residual) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i       = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i       = id * tile_cells + local;
             residual[i] = level.rhs[i] - matrix_product(level, solution, i);
         }
     }
 
     __global__ void project_velocity(Grid grid, Fields fields, const float* pressure, float h, float3 wind) {
         int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < tileCells; local += blockDim.x) {
-            int i = id * tileCells + local;
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = id * tile_cells + local;
             if (!grid.fluid[i]) {
                 fields.smoke[i]       = 0.0f;
                 fields.temperature[i] = 0.0f;
             }
             for (int axis = 0; axis < 3; ++axis) {
                 if (!face_valid(grid.layout, cell_coordinate(grid.layout, i), axis)) {
-                    fields.velocity[axis][i] = component(wind, axis);
+                    fields.velocity[axis][i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
                     continue;
                 }
                 int j      = neighbor(grid.layout, i, axis, -1);
                 bool right = grid.fluid[i], left = j >= 0 && grid.fluid[j];
-                if (grid.aperture[axis][i] <= 0.0f) fields.velocity[axis][i] = grid.solidVelocity[axis][i];
+                if (grid.aperture[axis][i] <= 0.0f) fields.velocity[axis][i] = grid.solid_velocity[axis][i];
                 else if (right || left) {
                     float difference = (right ? pressure[i] : 0.0f) - (left ? pressure[j] : 0.0f);
                     fields.velocity[axis][i] -= difference * (left && right ? 1.0f : 2.0f) / h;
-                } else fields.velocity[axis][i] = component(wind, axis);
+                } else fields.velocity[axis][i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
             }
         }
     }
 
     void precondition(PressureWorkspace workspace, cudaStream_t stream) {
-        for (int l = 0; l < workspace.levelCount; ++l) {
+        for (int l = 0; l < workspace.level_count; ++l) {
             auto level       = workspace.levels[l];
             const float* rhs = l == 0 ? workspace.residual : level.rhs;
-            if (l + 1 == workspace.levelCount) solve_coarsest<<<1, threads, 0, stream>>>(level, rhs, workspace.iteration);
+            if (l + 1 == workspace.level_count) solve_coarsest<<<1, threads, 0, stream>>>(level, rhs, workspace.iteration);
             else {
                 chebyshev_first<true><<<level.layout.blocks, threads, 0, stream>>>(level, rhs, workspace.iteration);
                 chebyshev_second<true><<<level.layout.blocks, threads, 0, stream>>>(level, rhs, workspace.iteration);
                 restrict_residual<<<workspace.levels[l + 1].layout.blocks, threads, 0, stream>>>(level, workspace.levels[l + 1], rhs, workspace.iteration);
             }
         }
-        for (int l = workspace.levelCount - 2; l >= 0; --l) {
+        for (int l = workspace.level_count - 2; l >= 0; --l) {
             auto level       = workspace.levels[l];
             const float* rhs = l == 0 ? workspace.residual : level.rhs;
             prolongate<<<level.layout.blocks, threads, 0, stream>>>(level, workspace.levels[l + 1], workspace.iteration);
@@ -416,12 +478,12 @@ namespace pyro::cuda::dense {
     void assemble_pressure(Grid grid, Fields fields, PressureWorkspace workspace, float h, bool obstacles, bool rebuild, cudaStream_t stream) {
         auto fine = workspace.levels[0];
         int count = fine.layout.blocks;
-        if (rebuild) assemble_fine<true><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.openComponents, workspace.anchors, workspace.solution, workspace.residual);
-        else assemble_fine<false><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.openComponents, workspace.anchors, workspace.solution, workspace.residual);
+        if (rebuild) assemble_fine<true><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.open_components, workspace.anchors, workspace.solution, workspace.residual);
+        else assemble_fine<false><<<count, threads, 0, stream>>>(grid, fields, fine, h, workspace.parents, workspace.open_components, workspace.anchors, workspace.solution, workspace.residual);
         if (obstacles && rebuild) {
             connect_components<<<count, threads, 0, stream>>>(fine, grid.fluid, workspace.parents);
-            mark_components<<<count, threads, 0, stream>>>(fine, workspace.parents, workspace.openComponents);
-            anchor_components<<<count, threads, 0, stream>>>(fine, grid.fluid, workspace.parents, workspace.openComponents, workspace.anchors, workspace.residual);
+            mark_components<<<count, threads, 0, stream>>>(fine, workspace.parents, workspace.open_components);
+            anchor_components<<<count, threads, 0, stream>>>(fine, grid.fluid, workspace.parents, workspace.open_components, workspace.anchors, workspace.residual);
             anchor_faces<<<count, threads, 0, stream>>>(fine, workspace.anchors);
         }
     }
@@ -434,10 +496,10 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         int count = fine.layout.blocks;
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 2, config.pressure_relative_tolerance, config.divergence_tolerance * 0.25f);
         precondition(workspace, stream);
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
         search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, true);
     }
 
@@ -445,13 +507,13 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         int count = fine.layout.blocks;
         apply_matrix<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0.0f, 0.0f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 1, 0.0f, 0.0f);
         update_iterate<<<count, threads, 0, stream>>>(fine, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
         count_iteration<<<1, 1, 0, stream>>>(workspace.iteration);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.25f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 3, config.pressure_relative_tolerance, config.divergence_tolerance * 0.25f);
         precondition(workspace, stream);
         dot_blocks<<<count, threads, 0, stream>>>(fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration, false);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, count, workspace.iteration, 0, 0.0f, 0.0f);
         search_direction<<<count, threads, 0, stream>>>(fine, workspace.direction, workspace.iteration, false);
     }
 
@@ -459,7 +521,7 @@ namespace pyro::cuda::dense {
         auto fine = workspace.levels[0];
         true_residual<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.solution, workspace.residual);
         dot_blocks<<<fine.layout.blocks, threads, 0, stream>>>(fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration, true);
-        finish_dot<threads><<<1, threads, 0, stream>>>(workspace.reductions, fine.layout.blocks, workspace.iteration, 3, config.pressureRelativeTolerance, config.divergenceTolerance * 0.5f);
+        finish_dot<<<1, threads, 0, stream>>>(workspace.reductions, fine.layout.blocks, workspace.iteration, 3, config.pressure_relative_tolerance, config.divergence_tolerance * 0.5f);
     }
 
     void apply_pressure(Grid grid, Fields fields, const float* pressure, float h, float3 wind, cudaStream_t stream) {

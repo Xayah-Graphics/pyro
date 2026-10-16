@@ -13,10 +13,10 @@ namespace pyro::cuda {
 
     __global__ void mesh_keys(Mesh mesh, unsigned* keys) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= mesh.triangleCount) return;
-        Triangle t    = mesh.triangles[i];
-        float3 p      = (t.a + t.b + t.c) / 3.0f;
-        float3 extent = mesh.bounds.upper - mesh.bounds.lower;
+        if (i >= mesh.triangle_count) return;
+        Triangle t = mesh.triangles[i];
+        float3 p{(t.a.x + t.b.x + t.c.x) * (1.0f / 3.0f), (t.a.y + t.b.y + t.c.y) * (1.0f / 3.0f), (t.a.z + t.b.z + t.c.z) * (1.0f / 3.0f)};
+        float3 extent{mesh.bounds.upper.x - mesh.bounds.lower.x, mesh.bounds.upper.y - mesh.bounds.lower.y, mesh.bounds.upper.z - mesh.bounds.lower.z};
         unsigned x    = min(1023u, static_cast<unsigned>(1023.0f * (p.x - mesh.bounds.lower.x) / fmaxf(extent.x, 1.0e-20f)));
         unsigned y    = min(1023u, static_cast<unsigned>(1023.0f * (p.y - mesh.bounds.lower.y) / fmaxf(extent.y, 1.0e-20f)));
         unsigned z    = min(1023u, static_cast<unsigned>(1023.0f * (p.z - mesh.bounds.lower.z) / fmaxf(extent.z, 1.0e-20f)));
@@ -26,14 +26,14 @@ namespace pyro::cuda {
 
     __global__ void mesh_leaves(Mesh mesh) {
         int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= mesh.leafCount) return;
+        if (i >= mesh.leaf_count) return;
         Bounds b{{1.0e30f, 1.0e30f, 1.0e30f}, {-1.0e30f, -1.0e30f, -1.0e30f}};
-        if (i < mesh.triangleCount) {
+        if (i < mesh.triangle_count) {
             Triangle t = mesh.triangles[mesh.order[i]];
             b.lower    = {fminf(t.a.x, fminf(t.b.x, t.c.x)), fminf(t.a.y, fminf(t.b.y, t.c.y)), fminf(t.a.z, fminf(t.b.z, t.c.z))};
             b.upper    = {fmaxf(t.a.x, fmaxf(t.b.x, t.c.x)), fmaxf(t.a.y, fmaxf(t.b.y, t.c.y)), fmaxf(t.a.z, fmaxf(t.b.z, t.c.z))};
         }
-        mesh.nodes[mesh.leafCount + i] = b;
+        mesh.nodes[mesh.leaf_count + i] = b;
     }
 
     __global__ void mesh_parents(Mesh mesh, int first) {
@@ -44,12 +44,13 @@ namespace pyro::cuda {
     }
 
     void build_mesh(Mesh mesh, cudaStream_t stream) {
+        constexpr int threads = 256;
         unsigned* keys;
-        cuda_check(cudaMallocAsync(reinterpret_cast<void**>(&keys), mesh.triangleCount * sizeof(unsigned), stream));
-        mesh_keys<<<(mesh.triangleCount + threads - 1) / threads, threads, 0, stream>>>(mesh, keys);
-        thrust::sort_by_key(thrust::cuda::par.on(stream), thrust::device_pointer_cast(keys), thrust::device_pointer_cast(keys + mesh.triangleCount), thrust::device_pointer_cast(mesh.order));
-        mesh_leaves<<<(mesh.leafCount + threads - 1) / threads, threads, 0, stream>>>(mesh);
-        for (int first = mesh.leafCount / 2; first; first /= 2) mesh_parents<<<(first + threads - 1) / threads, threads, 0, stream>>>(mesh, first);
-        cuda_check(cudaFreeAsync(keys, stream));
+        if (auto cuda_result = cudaMallocAsync(reinterpret_cast<void**>(&keys), mesh.triangle_count * sizeof(unsigned), stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        mesh_keys<<<(mesh.triangle_count + threads - 1) / threads, threads, 0, stream>>>(mesh, keys);
+        thrust::sort_by_key(thrust::cuda::par.on(stream), thrust::device_pointer_cast(keys), thrust::device_pointer_cast(keys + mesh.triangle_count), thrust::device_pointer_cast(mesh.order));
+        mesh_leaves<<<(mesh.leaf_count + threads - 1) / threads, threads, 0, stream>>>(mesh);
+        for (int first = mesh.leaf_count / 2; first; first /= 2) mesh_parents<<<(first + threads - 1) / threads, threads, 0, stream>>>(mesh, first);
+        if (auto cuda_result = cudaFreeAsync(keys, stream); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
     }
 } // namespace pyro::cuda

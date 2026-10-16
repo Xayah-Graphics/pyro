@@ -4,27 +4,29 @@ namespace pyro::cuda::sparse {
     template <bool obstacles>
     __device__ float3 trace(Grid grid, Fields carrier, Config config, float3 p, float time, float dt, bool& clipped) {
         clipped = false;
-        float h = config.cellSize;
+        float h = config.cell_size;
         if constexpr (obstacles) {
             float distance = sample_boundary(grid, p, time);
             if (distance < .01f * h) {
                 float3 gradient{};
-                float dx = sample_boundary(grid, p + float3{h * .25f, 0, 0}, time) - sample_boundary(grid, p - float3{h * .25f, 0, 0}, time);
-                float dy = sample_boundary(grid, p + float3{0, h * .25f, 0}, time) - sample_boundary(grid, p - float3{0, h * .25f, 0}, time);
-                float dz = sample_boundary(grid, p + float3{0, 0, h * .25f}, time) - sample_boundary(grid, p - float3{0, 0, h * .25f}, time);
-                gradient = {dx, dy, dz};
-                p        = p + gradient * ((.01f * h - distance) / fmaxf(length(gradient), 1.e-20f));
-                clipped  = true;
+                float dx    = sample_boundary(grid, {p.x + h * .25f, p.y, p.z}, time) - sample_boundary(grid, {p.x - h * .25f, p.y, p.z}, time);
+                float dy    = sample_boundary(grid, {p.x, p.y + h * .25f, p.z}, time) - sample_boundary(grid, {p.x, p.y - h * .25f, p.z}, time);
+                float dz    = sample_boundary(grid, {p.x, p.y, p.z + h * .25f}, time) - sample_boundary(grid, {p.x, p.y, p.z - h * .25f}, time);
+                gradient    = {dx, dy, dz};
+                float scale = (.01f * h - distance) / fmaxf(sqrtf(gradient.x * gradient.x + gradient.y * gradient.y + gradient.z * gradient.z), 1.e-20f);
+                p           = {p.x + gradient.x * scale, p.y + gradient.y * scale, p.z + gradient.z * scale};
+                clipped     = true;
             }
         }
-        float3 v = sample_velocity(grid, carrier, p, config.wind), middle = sample_velocity(grid, carrier, p - v * (.5f * dt), config.wind);
-        float3 departure = p - middle * dt;
+        float3 v = sample_velocity(grid, carrier, p, config.wind), middle = sample_velocity(grid, carrier, {p.x - v.x * (.5f * dt), p.y - v.y * (.5f * dt), p.z - v.z * (.5f * dt)}, config.wind);
+        float3 departure{p.x - middle.x * dt, p.y - middle.y * dt, p.z - middle.z * dt};
         if constexpr (!obstacles) return departure;
-        float bound = length(departure - p) + grid.colliderSpeed * fabsf(dt), fraction = 0;
+        float3 delta{departure.x - p.x, departure.y - p.y, departure.z - p.z};
+        float bound = sqrtf(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z) + grid.collider_speed * fabsf(dt), fraction = 0;
         if (bound < 1.e-12f) return departure;
         for (int step = 0; step < 64; ++step) {
-            float3 q = p + (departure - p) * fraction;
-            float d  = sample_boundary(grid, q, time - dt * fraction);
+            float3 q{p.x + delta.x * fraction, p.y + delta.y * fraction, p.z + delta.z * fraction};
+            float d = sample_boundary(grid, q, time - dt * fraction);
             if (d < .001f * h) {
                 clipped = true;
                 return q;
@@ -33,7 +35,7 @@ namespace pyro::cuda::sparse {
             if (fraction >= 1) return departure;
         }
         clipped = true;
-        return p + (departure - p) * fraction;
+        return {p.x + delta.x * fraction, p.y + delta.y * fraction, p.z + delta.z * fraction};
     }
     template <bool correct, bool obstacles>
     __global__ void transport_cells(Grid grid, Fields destination, Fields carrier, Config config, float time, float dt) {
@@ -44,12 +46,12 @@ namespace pyro::cuda::sparse {
             return;
         }
         float3 p = center(grid.layout, i);
-        bool clipped, reverseClipped = true;
+        bool clipped, reverse_clipped = true;
         float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, clipped), reverse{};
-        if (correct && !clipped) reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, reverseClipped);
+        if (correct && !clipped) reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, reverse_clipped);
         for (int field = 3; field < 5; ++field) {
             float lo, hi, value = sample(grid, grid.state, departure, field, 0, &lo, &hi);
-            if (correct && !clipped && !reverseClipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field))));
+            if (correct && !clipped && !reverse_clipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field))));
             (field == 3 ? destination.smoke : destination.temperature)[i] = value;
         }
     }
@@ -67,15 +69,15 @@ namespace pyro::cuda::sparse {
         int axis, owner, sign;
         face_position(grid.layout, f, p, h, axis, owner, sign);
         if (face.area <= 0) {
-            destination.velocity[f] = face.solidFlux / (h * h);
+            destination.velocity[f] = face.solid_flux / (h * h);
             return;
         }
         bool clipped;
         float3 departure = trace<obstacles>(grid, carrier, config, p, time + dt, dt, clipped);
-        float lo, hi, value = sample(grid, grid.state, departure, axis, component(config.wind, axis), &lo, &hi);
+        float lo, hi, value = sample(grid, grid.state, departure, axis, (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z), &lo, &hi);
         if (correct && !clipped) {
             float3 reverse = trace<obstacles>(grid, carrier, config, p, time, -dt, clipped);
-            if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, component(config.wind, axis)))));
+            if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, (axis == 0 ? config.wind.x : axis == 1 ? config.wind.y : config.wind.z)))));
         }
         destination.velocity[f] = value;
     }
@@ -84,9 +86,8 @@ namespace pyro::cuda::sparse {
         Block node = grid.layout.blocks[block];
         int level  = node.level;
         float h    = ldexpf(grid.layout.h, level);
-        float3 stagger{.5f, .5f, .5f};
-        if (field < 3) stagger = stagger - axis_vector(field, .5f);
-        float background = field < 3 ? component(wind, field) : 0;
+        float3 stagger{field == 0 ? 0.0f : .5f, field == 1 ? 0.0f : .5f, field == 2 ? 0.0f : .5f};
+        float background = field < 3 ? (field == 0 ? wind.x : field == 1 ? wind.y : wind.z) : 0;
         for (int local = threadIdx.x; local < 1331; local += blockDim.x) {
             int3 c{node.coordinate.x * 8 + local % 11 - 1, node.coordinate.y * 8 + (local / 11) % 11 - 1, node.coordinate.z * 8 + local / 121 - 1};
             int b        = (c.x >> 3) == node.coordinate.x && (c.y >> 3) == node.coordinate.y && (c.z >> 3) == node.coordinate.z ? block : find_block(grid.layout, {c.x >> 3, c.y >> 3, c.z >> 3}, level);
@@ -106,26 +107,33 @@ namespace pyro::cuda::sparse {
                 int i = locate(grid.layout, point);
                 if (i >= 0) {
                     const float* values = field == 3 ? fields.smoke : fields.temperature;
-                    if (grid.layout.blocks[i >> 9].level > level) value = values[i] + dot(scalar_gradient(grid, values, i), point - center(grid.layout, i));
-                    else {
+                    if (grid.layout.blocks[i >> 9].level > level) {
+                        float3 gradient = scalar_gradient(grid, values, i), c = center(grid.layout, i);
+                        value = values[i] + (gradient.x * (point.x - c.x) + gradient.y * (point.y - c.y) + gradient.z * (point.z - c.z));
+                    } else {
                         value = 0;
                         for (int child = 0; child < 8; ++child) {
-                            float3 sub = point + float3{(child & 1 ? .25f : -.25f) * h, (child & 2 ? .25f : -.25f) * h, (child & 4 ? .25f : -.25f) * h};
-                            int j      = locate(grid.layout, sub);
+                            float3 sub{point.x + (child & 1 ? .25f : -.25f) * h, point.y + (child & 2 ? .25f : -.25f) * h, point.z + (child & 4 ? .25f : -.25f) * h};
+                            int j = locate(grid.layout, sub);
                             if (j >= 0) value += values[j] * .125f;
                         }
                     }
                 }
             } else {
-                int i = locate(grid.layout, point + axis_vector(field, grid.layout.h * .001f));
+                float epsilon = grid.layout.h * .001f;
+                int i         = locate(grid.layout, float3{point.x + (field == 0 ? epsilon : 0), point.y + (field == 1 ? epsilon : 0), point.z + (field == 2 ? epsilon : 0)});
                 if (i >= 0 && grid.layout.blocks[i >> 9].level < level) {
                     value = 0;
-                    for (int child = 0; child < 4; ++child) value += .25f * face_value(grid, fields, point + axis_vector((field + 1) % 3, (child & 1 ? .25f : -.25f) * h) + axis_vector((field + 2) % 3, (child & 2 ? .25f : -.25f) * h), field, background);
+                    for (int child = 0; child < 4; ++child) {
+                        int a = (field + 1) % 3, b = (field + 2) % 3;
+                        float u = (child & 1 ? .25f : -.25f) * h, v = (child & 2 ? .25f : -.25f) * h;
+                        value += .25f * face_value(grid, fields, {point.x + (a == 0 ? u : 0) + (b == 0 ? v : 0), point.y + (a == 1 ? u : 0) + (b == 1 ? v : 0), point.z + (a == 2 ? u : 0) + (b == 2 ? v : 0)}, field, background);
+                    }
                 } else value = face_value(grid, fields, point, field, background);
             }
-            int index                  = (block * 5 + field) * 1331 + local;
-            output[index]              = value;
-            grid.uniformSamples[index] = uniform;
+            int index                   = (block * 5 + field) * 1331 + local;
+            output[index]               = value;
+            grid.uniform_samples[index] = uniform;
         }
     }
     void advect(Grid grid, Fields destination, Fields carrier, Config config, bool obstacles, float time, float dt, cudaStream_t stream) {
@@ -159,11 +167,11 @@ namespace pyro::cuda::sparse {
         for (int s = 0; s < count; ++s) {
             Source source    = sources[s];
             source.mesh.band = .5f * spacing(grid.layout, i);
-            float active     = fmaxf(0, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
+            float active     = fmaxf(0, fminf(time + dt, source.end_time) - fmaxf(time, source.start_time));
             if (!active) continue;
             float weight = source_weight(source, center(grid.layout, i), spacing(grid.layout, i), time + dt * .5f);
-            smoke += source.smokeRate * weight * active;
-            temperature += source.temperatureRate * weight * active;
+            smoke += source.smoke_rate * weight * active;
+            temperature += source.temperature_rate * weight * active;
         }
         destination.smoke[i]       = grid.fluid[i] ? smoke * expf(-.5f * config.dissipation * dt) : 0;
         destination.temperature[i] = grid.fluid[i] ? temperature * expf(-.5f * config.cooling * dt) : 0;
@@ -178,15 +186,16 @@ namespace pyro::cuda::sparse {
         face_position(grid.layout, f, p, h, axis, owner, sign);
         float smoke       = .5f * ((face.left >= 0 ? carrier.smoke[face.left] : 0) + (face.right >= 0 ? carrier.smoke[face.right] : 0));
         float temperature = .5f * ((face.left >= 0 ? carrier.temperature[face.left] : 0) + (face.right >= 0 ? carrier.temperature[face.right] : 0));
-        float v           = destination.velocity[f] + component(config.up, axis) * (config.buoyancy * temperature - config.smokeWeight * smoke) * dt;
+        float v           = destination.velocity[f] + (axis == 0 ? config.up.x : axis == 1 ? config.up.y : config.up.z) * (config.buoyancy * temperature - config.smoke_weight * smoke) * dt;
         for (int s = 0; s < count; ++s) {
             Source source    = sources[s];
             source.mesh.band = .5f * h;
-            float active     = fmaxf(0, fminf(time + dt, source.endTime) - fmaxf(time, source.startTime));
+            float active     = fmaxf(0, fminf(time + dt, source.end_time) - fmaxf(time, source.start_time));
             if (!active) continue;
             float3 motion{};
             float weight = source_weight(source, p, h, time + dt * .5f, &motion);
-            v += (component(source.velocity + motion * source.inheritVelocity, axis) - v) * (1 - expf(-source.velocityRate * weight * active));
+            float target = axis == 0 ? source.velocity.x + motion.x * source.inherit_velocity : axis == 1 ? source.velocity.y + motion.y * source.inherit_velocity : source.velocity.z + motion.z * source.inherit_velocity;
+            v += (target - v) * (1 - expf(-source.velocity_rate * weight * active));
         }
         destination.velocity[f] = v;
     }
@@ -203,7 +212,7 @@ namespace pyro::cuda::sparse {
         for (int local = threadIdx.x; local < 512; local += blockDim.x) {
             int i = b * 512 + local;
             if (!grid.fluid[i]) continue;
-            float div = -grid.solidDivergence[i], velocitySquared = 0;
+            float div = -grid.solid_divergence[i], velocity_squared = 0;
             if constexpr (full) {
                 double h = spacing(grid.layout, i), volume = h * h * h;
                 ++fluid;
@@ -213,11 +222,11 @@ namespace pyro::cuda::sparse {
             for (int a = 0; a < 3; ++a) {
                 if constexpr (full) div += (side_velocity(grid, grid.state, i, a, 1, true) - side_velocity(grid, grid.state, i, a, -1, true)) / spacing(grid.layout, i);
                 float v = fmaxf(fabsf(side_velocity(grid, grid.state, i, a, -1)), fabsf(side_velocity(grid, grid.state, i, a, 1)));
-                velocitySquared += v * v;
+                velocity_squared += v * v;
             }
             if constexpr (full) divergence = fmax(divergence, double(fabsf(div)));
-            speed        = fmax(speed, double(sqrtf(velocitySquared)));
-            acceleration = fmax(acceleration, double(fabsf(config.buoyancy * grid.state.temperature[i] - config.smokeWeight * grid.state.smoke[i])));
+            speed        = fmax(speed, double(sqrtf(velocity_squared)));
+            acceleration = fmax(acceleration, double(fabsf(config.buoyancy * grid.state.temperature[i] - config.smoke_weight * grid.state.smoke[i])));
         }
         if constexpr (full) {
             double values[6]{fluid, divergence, speed, smoke, heat, acceleration};
@@ -236,26 +245,26 @@ namespace pyro::cuda::sparse {
             for (int k = 0; k < count; ++k) results[b * count + k] = sums[k][0];
     }
     template <bool full>
-    __global__ void finish_measure(Grid grid, const Source* sources, int sourceCount, float time, double* results) {
+    __global__ void finish_measure(Grid grid, const Source* sources, int source_count, float time, double* results) {
         constexpr int count = full ? 6 : 2;
         int k               = threadIdx.x;
         if (k >= count) return;
         double value = 0;
         for (int b = 0; b < grid.layout.count; ++b) value = full && (k == 0 || k == 3 || k == 4) ? value + results[b * count + k] : fmax(value, results[b * count + k]);
         if (k == (full ? 2 : 0)) {
-            for (int s = 0; s < sourceCount; ++s)
-                if (time >= sources[s].startTime && time <= sources[s].endTime) value = fmax(value, double(length(sources[s].velocity) + sources[s].motion.maxSpeed * sources[s].inheritVelocity));
-            value = fmax(value, double(grid.colliderSpeed));
+            for (int s = 0; s < source_count; ++s)
+                if (time >= sources[s].start_time && time <= sources[s].end_time) value = fmax(value, double(sqrtf(sources[s].velocity.x * sources[s].velocity.x + sources[s].velocity.y * sources[s].velocity.y + sources[s].velocity.z * sources[s].velocity.z) + sources[s].motion.max_speed * sources[s].inherit_velocity));
+            value = fmax(value, double(grid.collider_speed));
         }
         results[grid.layout.count * count + k] = value;
     }
-    void measure(Grid grid, Config config, const Source* sources, int sourceCount, float time, bool full, double* reductions, cudaStream_t stream) {
+    void measure(Grid grid, Config config, const Source* sources, int source_count, float time, bool full, double* reductions, cudaStream_t stream) {
         if (full) {
             if (grid.layout.count) measure_blocks<true><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
-            finish_measure<true><<<1, 32, 0, stream>>>(grid, sources, sourceCount, time, reductions);
+            finish_measure<true><<<1, 32, 0, stream>>>(grid, sources, source_count, time, reductions);
         } else {
             if (grid.layout.count) measure_blocks<false><<<grid.layout.count, 256, 0, stream>>>(grid, config, reductions);
-            finish_measure<false><<<1, 32, 0, stream>>>(grid, sources, sourceCount, time, reductions);
+            finish_measure<false><<<1, 32, 0, stream>>>(grid, sources, source_count, time, reductions);
         }
     }
 } // namespace pyro::cuda::sparse
