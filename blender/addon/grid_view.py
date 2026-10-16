@@ -1,4 +1,5 @@
 """World-space solver leaf overlays, level-aware inspection and dense domain preview."""
+
 import json
 from pathlib import Path
 
@@ -9,37 +10,16 @@ from gpu_extras.batch import batch_for_shader
 import numpy as np
 
 
-views = {}
-domains = {}
-shader = None
-handler = None
 CORNERS = np.array([(i & 1, (i >> 1) & 1, (i >> 2) & 1) for i in range(8)], dtype=np.float32)
 EDGES = np.array([(i, i | (1 << axis)) for axis in range(3) for i in range(8) if not i & (1 << axis)], dtype=np.uint32)
 LEVEL_NAMES = ("Cyan", "Orange", "Violet", "Lime", "Blue", "Pink", "Yellow", "White")
 LEVEL_COLORS = np.array(((0.1, 0.8, 1), (1, 0.5, 0.1), (0.7, 0.3, 1), (0.45, 1, 0.2),
                          (0.25, 0.4, 1), (1, 0.3, 0.65), (1, 0.9, 0.15), (0.85, 0.9, 0.95)), dtype=np.float32)
 
-
-def redraw(self, context):
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == "VIEW_3D":
-                area.tag_redraw()
-
-
-def refresh(self, context):
-    key = self.id_data.as_pointer()
-    domains.pop(key, None)
-    view = views.get(key)
-    if view:
-        view["dirty"] = True
-        if not self.grid_show:
-            view["blocks"] = None
-            view["removed"] = view["changes"] = None
-            view["batches"] = []
-        elif self.algorithm == "SPARSE" and not self.stale and view["blocks"] is None:
-            load(self.id_data, Path(view["stamp"][0]), view["stamp"][1], view["start"])
-    redraw(self, context)
+views = {}
+domains = {}
+shader = None
+handler = None
 
 
 def load(scene, directory, frame, start):
@@ -212,6 +192,28 @@ def draw():
         gpu.state.depth_test_set(depth)
         gpu.state.depth_mask_set(mask)
         gpu.state.blend_set(blend)
+
+
+def redraw(self, context):
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+def refresh(self, context):
+    key = self.id_data.as_pointer()
+    domains.pop(key, None)
+    view = views.get(key)
+    if view:
+        view["dirty"] = True
+        if not self.grid_show:
+            view["blocks"] = None
+            view["removed"] = view["changes"] = None
+            view["batches"] = []
+        elif self.algorithm == "SPARSE" and not self.stale and view["blocks"] is None:
+            load(self.id_data, Path(view["stamp"][0]), view["stamp"][1], view["start"])
+    redraw(self, context)
 
 
 class PYRO_OT_grid_pick(bpy.types.Operator):

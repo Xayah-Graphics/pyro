@@ -1,0 +1,388 @@
+#ifndef PYRO_SOLVER_SPARSE_GRID_CUH
+#define PYRO_SOLVER_SPARSE_GRID_CUH
+
+#include <cuda/stream>
+
+#include <solver/common/scene.cuh>
+
+namespace pyro::sparse {
+    inline constexpr unsigned long long empty_key = ~0ull;
+
+    struct GridConfig {
+        float cell_size{0.05f};
+        int levels{3};
+        int pressure_padding{1};
+        int adapt_interval{2};
+        int coarsen_delay{4};
+        int keep_alive{4};
+        float smoke_absolute_error{0.0003125f};
+        float temperature_absolute_error{0.00125f};
+        float velocity_absolute_error{0.001875f};
+        float relative_error{0.003125f};
+        float smoke_threshold{1.e-5f};
+        float temperature_threshold{1.e-4f};
+        float velocity_threshold{0.025f};
+        float cfl{0.75f};
+        float3 wind{};
+    };
+
+    struct Node {
+        int3 coordinate{};
+        int level{};
+    };
+
+    struct Block {
+        int3 coordinate{};
+        int level{};
+        int quiet{};
+        int remaining{};
+    };
+
+    struct DensityBlock {
+        int3 coordinate{};
+        int level{};
+        int quiet{};
+        int remaining{};
+        float values[512];
+    };
+
+    struct Layout {
+        Block* blocks{};
+        unsigned long long* keys{};
+        int* indices{};
+        int count{};
+        int capacity{};
+        int table_size{};
+        int levels{};
+        float h{};
+    };
+
+    struct Fields {
+        float* smoke{};
+        float* temperature{};
+        float* velocity{};
+        float* samples{};
+    };
+
+    struct Face {
+        int left{-1};
+        int right{-1};
+        int group{-1};
+        float area{};
+        float solid_flux{};
+        float weight{};
+        float distance{};
+    };
+
+    struct Links {
+        int face[4]{-1, -1, -1, -1};
+    };
+
+    struct Grid {
+        Layout layout;
+        Face* faces{};
+        Links* links{};
+        unsigned char* fluid{};
+        float* solid_divergence{};
+        Fields state;
+        Fields midpoint;
+        Fields next;
+        Fields transported;
+        float* samples[3]{};
+        unsigned char* uniform_samples{};
+        float* distance[3]{};
+        float geometry_time{};
+        float geometry_duration{};
+        float collider_speed{};
+        BoundaryMode boundary_mode{BoundaryMode::none};
+    };
+
+    struct Scratch {
+        unsigned long long* keys[3]{};
+        float* values[2]{};
+        int* count{};
+        int capacity{};
+        void* sort_storage{};
+        unsigned long long sort_bytes{};
+    };
+
+    struct Topology {
+        unsigned long long* roots{};
+        unsigned long long* refine{};
+        int* decision{};
+        int* quiet{};
+        int* remaining{};
+        int* split{};
+        Block* candidates{};
+        int* counters{};
+        int table_size{};
+        int capacity{};
+    };
+
+    __host__ __device__ inline unsigned long long key(int3 p, int level) {
+        return (static_cast<unsigned long long>(p.x + 262144) & 0x7ffffull) | ((static_cast<unsigned long long>(p.y + 262144) & 0x7ffffull) << 19) | ((static_cast<unsigned long long>(p.z + 262144) & 0x7ffffull) << 38) | (static_cast<unsigned long long>(level) << 57);
+    }
+
+    __host__ __device__ inline Node node(unsigned long long k) {
+        return {{int(k & 0x7ffff) - 262144, int((k >> 19) & 0x7ffff) - 262144, int((k >> 38) & 0x7ffff) - 262144}, int(k >> 57)};
+    }
+
+    __device__ inline int hash(unsigned long long k, int size) {
+        k ^= k >> 30;
+        k *= 0xbf58476d1ce4e5b9ull;
+        k ^= k >> 27;
+        k *= 0x94d049bb133111ebull;
+        k ^= k >> 31;
+        return int(k & (size - 1));
+    }
+
+    __device__ inline int insert(unsigned long long* keys, int size, unsigned long long k) {
+        int slot = hash(k, size);
+        for (int n = 0; n < size; ++n) {
+            auto previous = atomicCAS(keys + slot, empty_key, k);
+            if (previous == empty_key || previous == k) return slot;
+            slot = (slot + 1) & (size - 1);
+        }
+        return -1;
+    }
+
+    __device__ inline int lookup(const unsigned long long* keys, int size, unsigned long long k) {
+        int slot = hash(k, size);
+        for (int n = 0; n < size; ++n) {
+            if (keys[slot] == k) return slot;
+            if (keys[slot] == empty_key) return -1;
+            slot = (slot + 1) & (size - 1);
+        }
+        return -1;
+    }
+
+    __device__ inline int find_block(Layout layout, int3 p, int level) {
+        int slot = lookup(layout.keys, layout.table_size, key(p, level));
+        return slot < 0 ? -1 : layout.indices[slot];
+    }
+
+    __device__ inline int locate(Layout layout, int3 fine) {
+        for (int level = 0; level < layout.levels; ++level) {
+            int3 c{fine.x >> level, fine.y >> level, fine.z >> level};
+            int b = find_block(layout, {c.x >> 3, c.y >> 3, c.z >> 3}, level);
+            if (b >= 0) return b * 512 + (c.x & 7) + 8 * (c.y & 7) + 64 * (c.z & 7);
+        }
+        return -1;
+    }
+
+    __device__ inline int locate(Layout layout, float3 p) {
+        return locate(layout, int3{int(floorf(p.x / layout.h)), int(floorf(p.y / layout.h)), int(floorf(p.z / layout.h))});
+    }
+
+    __device__ inline float spacing(Layout layout, int i) {
+        return ldexpf(layout.h, layout.blocks[i >> 9].level);
+    }
+
+    __device__ inline int3 cell_coordinate(Layout layout, int i) {
+        int3 p = layout.blocks[i >> 9].coordinate;
+        return {p.x * 8 + (i & 7), p.y * 8 + ((i >> 3) & 7), p.z * 8 + ((i >> 6) & 7)};
+    }
+
+    __device__ inline float3 center(Layout layout, int i) {
+        int3 p  = cell_coordinate(layout, i);
+        float h = spacing(layout, i);
+        return {(p.x + .5f) * h, (p.y + .5f) * h, (p.z + .5f) * h};
+    }
+
+    __device__ inline int transverse(int local, int axis) {
+        return axis == 0 ? ((local >> 3) & 7) + 8 * (local >> 6) : axis == 1 ? (local & 7) + 8 * (local >> 6) : (local & 7) + (local & 56);
+    }
+
+    __device__ inline int negative_face(int i, int axis) {
+        return (i >> 9) * 1728 + axis * 576 + (i & 511);
+    }
+
+    __device__ inline int positive_face(int i, int axis) {
+        return (i >> 9) * 1728 + axis * 576 + 512 + transverse(i & 511, axis);
+    }
+
+    __device__ inline Links cell_faces(Grid grid, int i, int axis, int sign) {
+        int v = (i >> (3 * axis)) & 7;
+        if ((sign < 0 && v > 0) || (sign > 0 && v < 7)) return {{negative_face(i + (sign > 0 ? 1 << (3 * axis) : 0), axis), -1, -1, -1}};
+        return grid.links[(i >> 9) * 384 + (axis * 2 + (sign > 0)) * 64 + transverse(i & 511, axis)];
+    }
+
+    __device__ inline void face_position(Layout layout, int f, float3& p, float& h, int& axis, int& owner, int& sign) {
+        int b = f / 1728, a = (f % 1728) / 576, local = f % 576;
+        axis = a;
+        sign = local < 512 ? -1 : 1;
+        if (local >= 512) {
+            int t = local - 512, u = t & 7, v = t >> 3;
+            local = a == 0 ? 7 + u * 8 + v * 64 : a == 1 ? u + 56 + v * 64 : u + v * 8 + 448;
+        }
+        owner = b * 512 + local;
+        h     = spacing(layout, owner);
+        p     = center(layout, owner);
+        if (axis == 0) p.x += sign * .5f * h;
+        if (axis == 1) p.y += sign * .5f * h;
+        if (axis == 2) p.z += sign * .5f * h;
+    }
+
+    template <BoundaryMode boundary_mode>
+    __device__ inline float sample_boundary(Grid grid, float3 p, float time) {
+        int i = locate(grid.layout, p);
+        if (i < 0) return 4 * grid.layout.h;
+        int block       = i >> 9;
+        int3 origin     = grid.layout.blocks[block].coordinate;
+        float inverse_h = 1.0f / spacing(grid.layout, i);
+        float3 q{p.x * inverse_h - float(origin.x * 8), p.y * inverse_h - float(origin.y * 8), p.z * inverse_h - float(origin.z * 8)};
+        int3 base{min(7, max(0, int(floorf(q.x)))), min(7, max(0, int(floorf(q.y)))), min(7, max(0, int(floorf(q.z))))};
+        float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
+        float fraction = boundary_mode == BoundaryMode::stationary ? 0 : fminf(2, fmaxf(0, 2 * (time - grid.geometry_time) / grid.geometry_duration));
+        int lower      = fraction < 1 ? 0 : 1;
+        float blend = fraction - lower, sum = 0;
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x) {
+                    int index   = block * 729 + base.x + x + 9 * (base.y + y) + 81 * (base.z + z);
+                    float value = grid.distance[lower][index];
+                    if constexpr (boundary_mode == BoundaryMode::moving) value += (grid.distance[lower + 1][index] - value) * blend;
+                    sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
+                }
+        return sum;
+    }
+
+    template <BoundaryMode boundary_mode = BoundaryMode::moving>
+    __device__ inline float side_velocity(Grid grid, Fields fields, int i, int axis, int sign, bool total = false) {
+        Links links = cell_faces(grid, i, axis, sign);
+        float sum   = 0;
+        for (int f : links.face)
+            if (f >= 0) {
+                float face_h = ldexpf(grid.layout.h, grid.layout.blocks[f / 1728].level);
+                sum += total ? (boundary_mode == BoundaryMode::none ? face_h * face_h : grid.faces[f].area) * fields.velocity[f] + (boundary_mode == BoundaryMode::moving ? grid.faces[f].solid_flux : 0) : fields.velocity[f] * face_h * face_h;
+            }
+        float h = spacing(grid.layout, i);
+        return sum / (h * h);
+    }
+
+    __device__ inline float minmod(float a, float b) {
+        return a * b > 0 ? copysignf(fminf(fabsf(a), fabsf(b)), a) : 0;
+    }
+
+    __device__ inline float3 scalar_gradient(Grid grid, const float* field, int i) {
+        if (i < 0 || field[i] == 0) return {};
+        float q = field[i], h = spacing(grid.layout, i);
+        float3 c = center(grid.layout, i);
+        float slopes[3], extent = 0;
+        for (int a = 0; a < 3; ++a) {
+            int l = locate(grid.layout, float3{c.x - (a == 0 ? h : 0), c.y - (a == 1 ? h : 0), c.z - (a == 2 ? h : 0)}), r = locate(grid.layout, float3{c.x + (a == 0 ? h : 0), c.y + (a == 1 ? h : 0), c.z + (a == 2 ? h : 0)});
+            float dl = 0, dr = 0;
+            if (l >= 0) {
+                float3 left = center(grid.layout, l);
+                dl          = (q - field[l]) / (a == 0 ? c.x - left.x : a == 1 ? c.y - left.y : c.z - left.z);
+            }
+            if (r >= 0) {
+                float3 right = center(grid.layout, r);
+                dr           = (field[r] - q) / (a == 0 ? right.x - c.x : a == 1 ? right.y - c.y : right.z - c.z);
+            }
+            slopes[a] = minmod(dl, dr);
+            extent += fabsf(slopes[a]) * h * .5f;
+        }
+        float limiter = extent > q && q >= 0 ? q / extent : 1;
+        return {limiter * slopes[0], limiter * slopes[1], limiter * slopes[2]};
+    }
+
+    __device__ inline float face_value(Grid grid, Fields fields, float3 p, int axis, float background) {
+        float epsilon = grid.layout.h * .001f;
+        int i = locate(grid.layout, float3{p.x + (axis == 0 ? epsilon : 0), p.y + (axis == 1 ? epsilon : 0), p.z + (axis == 2 ? epsilon : 0)}), left = locate(grid.layout, float3{p.x - (axis == 0 ? epsilon : 0), p.y - (axis == 1 ? epsilon : 0), p.z - (axis == 2 ? epsilon : 0)});
+        if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
+        if (i < 0) return background;
+        float3 c  = center(grid.layout, i);
+        float t   = .5f + (axis == 0 ? p.x - c.x : axis == 1 ? p.y - c.y : p.z - c.z) / spacing(grid.layout, i);
+        float low = side_velocity(grid, fields, i, axis, -1), high = side_velocity(grid, fields, i, axis, 1);
+        return low + (high - low) * t;
+    }
+
+    template <bool bounds = false, bool uniform_output = false>
+    __device__ inline float native_sample(Grid grid, Fields fields, float3 p, int field, int anchor, float* lower = nullptr, float* upper = nullptr, bool* uniform = nullptr) {
+        int block  = anchor >> 9;
+        Block node = grid.layout.blocks[block];
+        float h    = spacing(grid.layout, anchor);
+        float3 stagger{field == 0 ? 0.0f : .5f, field == 1 ? 0.0f : .5f, field == 2 ? 0.0f : .5f};
+        float inverse_h = 1.0f / h;
+        float3 q{p.x * inverse_h - stagger.x, p.y * inverse_h - stagger.y, p.z * inverse_h - stagger.z};
+        int3 base{int(floorf(q.x)), int(floorf(q.y)), int(floorf(q.z))};
+        float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
+        int first = (block * 5 + field) * 1331 + base.x - node.coordinate.x * 8 + 1 + 11 * (base.y - node.coordinate.y * 8 + 1) + 121 * (base.z - node.coordinate.z * 8 + 1);
+        float sum = 0, lo = 1.e30f, hi = -1.e30f;
+        bool same_level = true;
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x) {
+                    int index   = first + x + 11 * y + 121 * z;
+                    float value = fields.samples[index];
+                    if constexpr (uniform_output) same_level &= grid.uniform_samples[index] != 0;
+                    sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
+                    if constexpr (bounds) {
+                        lo = fminf(lo, value);
+                        hi = fmaxf(hi, value);
+                    }
+                }
+        if constexpr (bounds) *lower = lo;
+        if constexpr (bounds) *upper = hi;
+        if constexpr (uniform_output) *uniform = same_level;
+        return sum;
+    }
+
+    template <bool bounds = false>
+    __device__ inline float sample(Grid grid, Fields fields, float3 p, int field, float background = 0, float* lower = nullptr, float* upper = nullptr) {
+        int anchor = locate(grid.layout, p);
+        if (anchor >= 0) {
+            bool uniform;
+            float value = native_sample<bounds, true>(grid, fields, p, field, anchor, lower, upper, &uniform);
+            if (uniform) return value;
+        }
+        float h         = .5f * grid.layout.h;
+        float inverse_h = 1.0f / h;
+        float3 q{p.x * inverse_h, p.y * inverse_h, p.z * inverse_h};
+        int3 base{int(floorf(q.x)), int(floorf(q.y)), int(floorf(q.z))};
+        float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
+        float sum = 0, lo = 1.e30f, hi = -1.e30f;
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x) {
+                    float3 point{(base.x + x) * h, (base.y + y) * h, (base.z + z) * h};
+                    int i = locate(grid.layout, point);
+                    if (field < 3) {
+                        float epsilon = grid.layout.h * .001f;
+                        int left      = locate(grid.layout, float3{point.x - (field == 0 ? epsilon : 0), point.y - (field == 1 ? epsilon : 0), point.z - (field == 2 ? epsilon : 0)});
+                        if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
+                    }
+                    if (i < 0)
+                        for (int corner = 1; corner < 8 && i < 0; ++corner) i = locate(grid.layout, float3{point.x - (corner & 1 ? .002f : 0) * h, point.y - (corner & 2 ? .002f : 0) * h, point.z - (corner & 4 ? .002f : 0) * h});
+                    float value = i < 0 ? background : native_sample(grid, fields, point, field, i);
+                    sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
+                    if constexpr (bounds) {
+                        lo = fminf(lo, value);
+                        hi = fmaxf(hi, value);
+                    }
+                }
+        if constexpr (bounds) *lower = lo;
+        if constexpr (bounds) *upper = hi;
+        return sum;
+    }
+
+    __device__ inline float3 sample_velocity(Grid grid, Fields fields, float3 p, float3 wind) {
+        return {sample(grid, fields, p, 0, wind.x), sample(grid, fields, p, 1, wind.y), sample(grid, fields, p, 2, wind.z)};
+    }
+
+    unsigned long long scratch_bytes(Scratch scratch, ::cuda::stream_ref stream);
+
+    void rebuild_hash(Layout layout, ::cuda::stream_ref stream);
+
+    int adapt_topology(Grid old_grid, Grid new_grid, Topology topology, Scratch scratch, GridConfig config, const SourceView* sources, int source_count, const ColliderView* colliders, int collider_count, float time, float horizon, bool& changed, ::cuda::stream_ref stream);
+
+    void build_connectivity(Grid grid, ::cuda::stream_ref stream);
+
+    void sample_geometry(Grid grid, Layout previous, const float* previous_distance, const ColliderView* colliders, int count, float time, int sample, ::cuda::stream_ref stream);
+
+    void update_geometry(Grid grid, const ColliderView* colliders, int count, float time, int sample, ::cuda::stream_ref stream);
+
+    void pack_density(Grid grid, DensityBlock* output, ::cuda::stream_ref stream);
+}
+#endif

@@ -1,4 +1,5 @@
 """Explicit simulation inputs, sampled through Blender's evaluated dependency graph."""
+
 import hashlib
 import json
 import math
@@ -12,9 +13,10 @@ import numpy as np
 from .settings import CONFIG, OBJECT_INPUTS
 
 
-solver_digest = None
 TRANSFORMS = ("location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale",
               "delta_location", "delta_rotation_euler", "delta_rotation_quaternion", "delta_scale")
+
+solver_digest = None
 
 
 def participants(scene):
@@ -53,7 +55,7 @@ def dependencies(objects):
 
 
 def geometry(objects, graph, *, mesh_data=True):
-    triangles, corners, hashes = [], [], {}
+    meshes, instances, corners, hashes, assets = [], [], [], {}, {}
     for obj in objects:
         evaluated = obj.evaluated_get(graph)
         mesh = evaluated.to_mesh()
@@ -64,14 +66,18 @@ def geometry(objects, graph, *, mesh_data=True):
             mesh.vertices.foreach_get("co", vertices)
             mesh.loop_triangles.foreach_get("vertices", indices)
             vertices = vertices.reshape(-1, 3)
+            digest = hashlib.sha256(vertices.tobytes() + indices.tobytes()).hexdigest()
+            hashes[obj.name_full] = digest
             if mesh_data:
-                triangles.append(vertices[indices].reshape(-1, 9))
+                if digest not in assets:
+                    assets[digest] = len(meshes)
+                    meshes.append((vertices, indices.reshape(-1, 3)))
+                instances.append(assets[digest])
                 lower, upper = vertices.min(axis=0), vertices.max(axis=0)
                 corners.append(np.array([[upper[k] if i & (1 << k) else lower[k] for k in range(3)] + [1] for i in range(8)]).T)
-            hashes[obj.name_full] = hashlib.sha256(vertices.tobytes() + indices.tobytes()).hexdigest()
         finally:
             evaluated.to_mesh_clear()
-    return triangles, corners, hashes
+    return {"meshes": meshes, "instances": instances}, corners, hashes
 
 
 def settings_key(scene):
@@ -88,7 +94,7 @@ def signature(scene, dependencies, hashes):
     global solver_digest
     if solver_digest is None:
         root = Path(__file__).parent
-        digest = hashlib.sha256((root / "bin" / "pyro.exe").read_bytes())
+        digest = hashlib.sha256((root / "bin" / "pyro_stream.exe").read_bytes())
         for name in ("bridge.py", "inputs.py"):
             digest.update((root / name).read_bytes())
         solver_digest = digest.hexdigest()

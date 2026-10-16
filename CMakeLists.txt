@@ -2,18 +2,12 @@
 # Project.
 # ============================================================================
 cmake_minimum_required(VERSION 4.4)
-set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "f35a9ac6-8463-4d38-8eec-5d6008153e7d")
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" PYRO_VERSION LIMIT_COUNT 1)
-project(PYRO VERSION "${PYRO_VERSION}" LANGUAGES CXX CUDA)
+project(PYRO VERSION "${PYRO_VERSION}" LANGUAGES CUDA)
 
 # ============================================================================
 # Project Configuration
 # ============================================================================
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_MODULE_STD ON)
-
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
@@ -27,34 +21,50 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(cmake/cuda.cmake)
 
 # ============================================================================
+# Geometry
+# ============================================================================
+add_library(geometry STATIC pyro/geometry/geometry.cu pyro/geometry/bvh.cu)
+target_link_libraries(geometry PUBLIC CUDA::cudart)
+target_include_directories(geometry PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/pyro")
+
+# ============================================================================
 # Solver
 # ============================================================================
-add_library(pyro_geometry STATIC solver/geometry.cpp solver/geometry.cu)
-target_sources(pyro_geometry PUBLIC FILE_SET CXX_MODULES FILES solver/types.ixx solver/geometry.ixx)
-target_link_libraries(pyro_geometry PUBLIC CUDA::cudart)
 foreach(backend IN ITEMS sparse dense lfm)
     add_library(pyro_${backend} STATIC
-        solver/${backend}/solver.cpp
-        solver/${backend}/grid.cu
-        solver/${backend}/advection.cu
-        solver/${backend}/pressure.cu
+        pyro/solver/${backend}/solver.cu
+        pyro/solver/${backend}/grid.cu
+        pyro/solver/${backend}/advection.cu
+        pyro/solver/${backend}/pressure.cu
+        pyro/solver/${backend}/statistics.cu
     )
-    target_sources(pyro_${backend} PUBLIC FILE_SET CXX_MODULES FILES solver/${backend}/solver.ixx)
-    target_link_libraries(pyro_${backend} PUBLIC pyro_geometry)
+    target_link_libraries(pyro_${backend} PUBLIC geometry)
 endforeach()
-target_sources(pyro_sparse PRIVATE solver/sparse/transfer.cu)
-target_sources(pyro_lfm PRIVATE solver/lfm/flow_map.cu)
-foreach(target IN ITEMS pyro_geometry pyro_sparse pyro_dense pyro_lfm)
-    target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>")
-    target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>")
-endforeach()
+target_sources(pyro_dense PRIVATE pyro/solver/dense/forces.cu)
+target_sources(pyro_sparse PRIVATE pyro/solver/sparse/forces.cu pyro/solver/sparse/transfer.cu)
+target_sources(pyro_lfm PRIVATE pyro/solver/lfm/flow_map.cu)
 
 # ============================================================================
 # Executables
 # ============================================================================
-add_executable(pyro main.cpp io/stream.cpp)
-target_sources(pyro PRIVATE FILE_SET CXX_MODULES FILES io/stream.ixx)
-target_link_libraries(pyro PRIVATE pyro_sparse pyro_dense pyro_lfm)
+add_executable(pyro_benchmark pyro/benchmark/benchmark.cu)
+add_executable(pyro_stream pyro/io/stream.cu)
+add_executable(pyro_dense_benchmark pyro/benchmark/dense.cu)
+target_link_libraries(pyro_dense_benchmark PRIVATE pyro_dense)
+foreach(target IN ITEMS pyro_benchmark pyro_stream)
+    target_link_libraries(${target} PRIVATE pyro_sparse pyro_dense pyro_lfm)
+endforeach()
+
+option(PYRO_CUDA_LINEINFO "Emit CUDA source locations for profiling" OFF)
+option(PYRO_CUDA_RESOURCE_REPORT "Report per-kernel CUDA register and memory usage" OFF)
+foreach(target IN ITEMS geometry pyro_sparse pyro_dense pyro_lfm pyro_benchmark pyro_stream pyro_dense_benchmark)
+    if(PYRO_CUDA_LINEINFO)
+        target_compile_options(${target} PRIVATE -lineinfo)
+    endif()
+    if(PYRO_CUDA_RESOURCE_REPORT)
+        target_compile_options(${target} PRIVATE -Xptxas=-v)
+    endif()
+endforeach()
 
 # ============================================================================
 # Blender (Windows).

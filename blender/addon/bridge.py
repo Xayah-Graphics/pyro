@@ -1,6 +1,7 @@
 """Blocking binary calls to one resident CUDA process."""
-from pathlib import Path
+
 import json
+from pathlib import Path
 import struct
 import subprocess
 import time
@@ -26,7 +27,7 @@ def acknowledge(session):
 
 def start(scene, objects, geometry, corners, dynamic, directory):
     with (directory / "solver.log").open("wb") as log:
-        solver = subprocess.Popen([str(Path(__file__).parent / "bin" / "pyro.exe"), "--stream"], cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
+        solver = subprocess.Popen([str(Path(__file__).parent / "bin" / "pyro_stream.exe")], cwd=directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, creationflags=subprocess.CREATE_NO_WINDOW)
     try:
         job = process.attach(solver.pid)
     except Exception:
@@ -40,23 +41,22 @@ def start(scene, objects, geometry, corners, dynamic, directory):
         for name, kind in config:
             value = getattr(scene.pyro, name)
             values.extend(value if kind in {"3f", "3i"} else [value])
-        solver.stdin.write(b"PYROSTR3" + {"SPARSE": b"S", "DENSE": b"D", "LFM": b"L"}[session["algorithm"]])
+        solver.stdin.write(b"PYROSTR5" + {"SPARSE": b"S", "DENSE": b"D", "LFM": b"L"}[session["algorithm"]])
         solver.stdin.write(struct.pack("<" + "".join(kind for _, kind in config), *values))
-        solver.stdin.write(struct.pack("<i", len(objects)))
-        for triangles in geometry:
-            solver.stdin.write(struct.pack("<i", len(triangles)) + triangles.tobytes())
+        solver.stdin.write(struct.pack("<i", len(geometry["meshes"])))
+        for positions, triangles in geometry["meshes"]:
+            solver.stdin.write(struct.pack("<ii", len(positions), len(triangles)) + positions.tobytes() + triangles.tobytes())
+        solver.stdin.write(struct.pack("<i", len(geometry["instances"])))
+        solver.stdin.write(struct.pack("<" + "i" * len(geometry["instances"]), *geometry["instances"]))
         if session["algorithm"] == "LFM":
             samples = inputs.sample(scene, objects, scene.frame_start)
-            colliders = []
-            for i, (_, active, values) in enumerate(samples):
+            motions, colliders = [], []
+            for i, (matrix, active, values) in enumerate(samples):
                 if not active:
                     continue
-                matrix = samples[i][0]
-                points = matrix @ corners[i]
-                surface = values[0]
-                colliders.append(struct.pack("<i33f", i, *matrix.flat, *([0.0]*12), 0, 0,
-                                             *(points.min(axis=1)-abs(surface)), *(points.max(axis=1)+abs(surface)), surface))
-            solver.stdin.write(struct.pack("<i", len(colliders)) + b"".join(colliders))
+                motions.append(struct.pack("<i25f", i, *matrix.flat, *([0.0]*12), 0))
+                colliders.append(struct.pack("<if", i, values[0]))
+            solver.stdin.write(struct.pack("<ii", len(motions), len(colliders)) + b"".join(motions + colliders))
         acknowledge(session)
     except Exception:
         close(session)
@@ -84,24 +84,18 @@ def advance(scene, session):
         if error > scene.pyro.cell_size * scene.pyro.animation_tolerance:
             segments.extend([(middle, b), (a, middle)])
             continue
-        sources, colliders = [], []
+        motions, sources, colliders = [], [], []
         for i, obj in enumerate(session["objects"]):
             _, active, values = mid[i]
             if not active:
                 continue
             derivative = (last[i][0] - first[i][0]) * (fps / (b - a))
-            points = np.concatenate((first[i][0] @ session["corners"][i], last[i][0] @ session["corners"][i]), axis=1)
-            speed = np.linalg.norm(derivative @ session["corners"][i], axis=0).max()
-            lower, upper = points.min(axis=1), points.max(axis=1)
-            if obj.pyro.role == "COLLIDER":
-                surface = values[0]
-                lower, upper = lower - abs(surface), upper + abs(surface)
-            motion = struct.pack("<i32f", i, *first[i][0].flat, *derivative.flat, (a-start)/fps, speed, *lower, *upper)
+            motions.append(struct.pack("<i25f", i, *first[i][0].flat, *derivative.flat, (a-start)/fps))
             if obj.pyro.role == "EMITTER":
-                sources.append(motion + struct.pack("<7f", *values))
+                sources.append(struct.pack("<i7f", i, *values))
             else:
-                colliders.append(motion + struct.pack("<f", surface))
-        session["solver"].stdin.write(b"A" + struct.pack("<dii", (b-start)/fps, len(sources), len(colliders)) + b"".join(sources + colliders))
+                colliders.append(struct.pack("<if", i, values[0]))
+        session["solver"].stdin.write(b"A" + struct.pack("<diii", (b-start)/fps, len(motions), len(sources), len(colliders)) + b"".join(motions + sources + colliders))
         acknowledge(session)
     session["current"] = current + 1
     session["samples"] = {float(current + 1): samples[float(current + 1)]}

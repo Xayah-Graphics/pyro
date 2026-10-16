@@ -11,8 +11,9 @@ AlignTrailingComments:
 AllowShortFunctionsOnASingleLine: Empty
 BreakTemplateDeclarations: Yes
 BreakBeforeBinaryOperators: NonAssignment
+BreakConstructorInitializers: BeforeColon
 ColumnLimit: 1024
-IncludeBlocks: Merge
+IncludeBlocks: Preserve
 IncludeCategories:
   - Regex: '.*'
     Priority: 1
@@ -24,9 +25,11 @@ AllowShortIfStatementsOnASingleLine: AllIfsAndElse
 AllowShortLoopsOnASingleLine: true
 AllowShortCaseLabelsOnASingleLine: true
 InsertNewlineAtEOF: true
-MaxEmptyLinesToKeep: 2
+MaxEmptyLinesToKeep: 1
 NamespaceIndentation: All
+PackConstructorInitializers: Never
 PointerAlignment: Left
+FixNamespaceComments: false
 RemoveSemicolon: true
 SpaceAfterCStyleCast: true
 SpaceBeforeParens: Custom
