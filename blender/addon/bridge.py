@@ -8,6 +8,7 @@ import time
 
 import numpy as np
 import openvdb
+from mathutils import Matrix
 
 from . import inputs, process
 from .settings import CONFIG
@@ -23,6 +24,19 @@ def acknowledge(session):
     solver.stdin.flush()
     if solver.stdout.read(1) != b"K":
         raise RuntimeError((session["directory"] / "solver.log").read_text(encoding="utf-8", errors="replace") or "Solver pipe closed")
+
+
+def motion(instance, obj, first, last, rate, seconds):
+    if obj.pyro.geometry_type == "MESH":
+        return struct.pack("<i25f", instance, *first.flat, *((last-first)*rate).flat, seconds)
+    rotation = Matrix(first[:, :3].tolist()).to_quaternion()
+    delta = Matrix(last[:, :3].tolist()).to_quaternion() @ rotation.conjugated()
+    if delta.w < 0:
+        delta.negate()
+    angular = delta.to_exponential_map() * rate
+    velocity = (last[:, 3]-first[:, 3])*rate
+    scale = float(np.linalg.norm(first[:, 0]))
+    return struct.pack("<i15f", instance, *first[:, 3], rotation.x, rotation.y, rotation.z, rotation.w, *velocity, *angular, seconds, scale)
 
 
 def start(scene, objects, geometry, corners, dynamic, directory):
@@ -41,11 +55,15 @@ def start(scene, objects, geometry, corners, dynamic, directory):
         for name, kind in config:
             value = getattr(scene.pyro, name)
             values.extend(value if kind in {"3f", "3i"} else [value])
-        solver.stdin.write(b"PYROSTR5" + {"SPARSE": b"S", "DENSE": b"D", "LFM": b"L"}[session["algorithm"]])
+        solver.stdin.write(b"PYROSTR6" + {"SPARSE": b"S", "DENSE": b"D", "LFM": b"L"}[session["algorithm"]])
         solver.stdin.write(struct.pack("<" + "".join(kind for _, kind in config), *values))
-        solver.stdin.write(struct.pack("<i", len(geometry["meshes"])))
-        for positions, triangles in geometry["meshes"]:
-            solver.stdin.write(struct.pack("<ii", len(positions), len(triangles)) + positions.tobytes() + triangles.tobytes())
+        solver.stdin.write(struct.pack("<i", len(geometry["shapes"])))
+        for kind, shape in geometry["shapes"]:
+            if kind == "SPHERE":
+                solver.stdin.write(struct.pack("<cf", b"S", shape))
+            else:
+                positions, triangles = shape
+                solver.stdin.write(struct.pack("<cii", b"M", len(positions), len(triangles)) + positions.tobytes() + triangles.tobytes())
         solver.stdin.write(struct.pack("<i", len(geometry["instances"])))
         solver.stdin.write(struct.pack("<" + "i" * len(geometry["instances"]), *geometry["instances"]))
         if session["algorithm"] == "LFM":
@@ -54,7 +72,7 @@ def start(scene, objects, geometry, corners, dynamic, directory):
             for i, (matrix, active, values) in enumerate(samples):
                 if not active:
                     continue
-                motions.append(struct.pack("<i25f", i, *matrix.flat, *([0.0]*12), 0))
+                motions.append(motion(i, objects[i], matrix, matrix, 0, 0))
                 colliders.append(struct.pack("<if", i, values[0]))
             solver.stdin.write(struct.pack("<ii", len(motions), len(colliders)) + b"".join(motions + colliders))
         acknowledge(session)
@@ -89,8 +107,7 @@ def advance(scene, session):
             _, active, values = mid[i]
             if not active:
                 continue
-            derivative = (last[i][0] - first[i][0]) * (fps / (b - a))
-            motions.append(struct.pack("<i25f", i, *first[i][0].flat, *derivative.flat, (a-start)/fps))
+            motions.append(motion(i, obj, first[i][0], last[i][0], fps/(b-a), (a-start)/fps))
             if obj.pyro.role == "EMITTER":
                 sources.append(struct.pack("<i7f", i, *values))
             else:

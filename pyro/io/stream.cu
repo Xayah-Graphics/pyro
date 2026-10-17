@@ -31,9 +31,17 @@ int main() try {
         float cell_size;
         if constexpr (std::same_as<Solver, pyro::sparse::Solver>) cell_size = config.grid.cell_size;
         else cell_size = config.cell_size;
-        int meshes;
-        read(meshes);
-        for (int i = 0; i < meshes; ++i) {
+        int shapes;
+        read(shapes);
+        for (int i = 0; i < shapes; ++i) {
+            char kind;
+            read(kind);
+            if (kind == 'S') {
+                float radius;
+                read(radius);
+                solver.scene.shapes.push_back({.kind = geometry::ShapeKind::sphere, .sphere = {radius}});
+                continue;
+            }
             int point_count, triangle_count;
             read(point_count);
             read(triangle_count);
@@ -48,8 +56,14 @@ int main() try {
         solver.scene.instances.resize(instance_count);
         for (auto& instance : solver.scene.instances) {
             read(instance.shape);
-            instance.motion = {.kind = geometry::MotionKind::affine, .affine = {}};
+            if (solver.scene.shapes[instance.shape].kind == geometry::ShapeKind::mesh) instance.motion = {.kind = geometry::MotionKind::affine, .affine = {}};
+            else instance.motion = {.kind = geometry::MotionKind::rigid, .rigid = {}};
         }
+        auto read_motion = [&](int index) {
+            auto& motion = solver.scene.instances[index].motion;
+            if (motion.kind == geometry::MotionKind::affine) read(motion.affine);
+            else read(motion.rigid);
+        };
         if constexpr (std::same_as<Solver, pyro::lfm::Solver>) {
             int updates, count;
             read(updates);
@@ -57,9 +71,7 @@ int main() try {
             for (int i = 0; i < updates; ++i) {
                 int instance;
                 read(instance);
-                read(solver.scene.instances[instance].motion.affine.matrix);
-                read(solver.scene.instances[instance].motion.affine.derivative);
-                read(solver.scene.instances[instance].motion.affine.time);
+                read_motion(instance);
             }
             solver.colliders.resize(count);
             for (auto& collider : solver.colliders) {
@@ -85,9 +97,7 @@ int main() try {
                     for (int i = 0; i < updates; ++i) {
                         int instance;
                         read(instance);
-                        read(solver.scene.instances[instance].motion.affine.matrix);
-                        read(solver.scene.instances[instance].motion.affine.derivative);
-                        read(solver.scene.instances[instance].motion.affine.time);
+                        read_motion(instance);
                     }
                     solver.sources.resize(source_count);
                     solver.colliders.resize(collider_count);
@@ -172,7 +182,7 @@ int main() try {
     };
     std::array<char, 8> protocol;
     read(protocol);
-    if (protocol != std::array{'P', 'Y', 'R', 'O', 'S', 'T', 'R', '5'}) throw std::runtime_error("Unsupported solver stream format");
+    if (protocol != std::array{'P', 'Y', 'R', 'O', 'S', 'T', 'R', '6'}) throw std::runtime_error("Unsupported solver stream format");
     char algorithm;
     read(algorithm);
     if (algorithm == 'S') {

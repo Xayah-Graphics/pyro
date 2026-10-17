@@ -276,6 +276,10 @@ def draw_object(layout, context):
             action = row.operator("pyro.set_role", text=label)
             action.object_name, action.role = obj.name, role
         return
+    layout.prop(props, "geometry_type")
+    if props.geometry_type == "SPHERE":
+        layout.prop(props, "sphere_radius")
+        draw_hint(layout, context, "Sphere at object origin; constant uniform scale")
     layout.prop(props, "active")
     if context.scene.pyro.stale:
         layout.label(text="Inputs changed — reset required", icon="ERROR")
@@ -288,7 +292,7 @@ def draw_object(layout, context):
         if body:
             body.prop(props, "smoke_rate")
             body.prop(props, "temperature_rate")
-            body.label(text="Emit inside the closed mesh volume")
+            body.label(text="Emit inside the geometry volume")
         header, body = layout.panel("pyro_injection", default_closed=False)
         header.label(text="Source Velocity")
         if body:

@@ -37,11 +37,15 @@ scene.render.resolution_percentage = 100
 bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=0.5, location=(0, 0, 1.5))
 collider = bpy.context.object
 collider.name = "Collision Sphere"
+collider.pyro.geometry_type = "SPHERE"
+collider.pyro.sphere_radius = 0.5
 bpy.ops.object.shade_smooth()
 
 bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=0.2, location=(0, 0, 0.25))
 emitter = bpy.context.object
 emitter.name = "Smoke Emitter"
+emitter.pyro.geometry_type = "SPHERE"
+emitter.pyro.sphere_radius = 0.2
 emitter.color = (1, 0.35, 0.05, 1)
 emitter.display_type = "WIRE"
 emitter.hide_render = True

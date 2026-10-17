@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import re
+import struct
 
 import bpy
 from mathutils import Vector
@@ -55,9 +56,20 @@ def dependencies(objects):
 
 
 def geometry(objects, graph, *, mesh_data=True):
-    meshes, instances, corners, hashes, assets = [], [], [], {}, {}
+    shapes, instances, corners, hashes, assets = [], [], [], {}, {}
     for obj in objects:
         evaluated = obj.evaluated_get(graph)
+        if obj.pyro.geometry_type == "SPHERE":
+            radius = obj.pyro.sphere_radius
+            digest = hashlib.sha256(struct.pack("<cf", b"S", radius)).hexdigest()
+            hashes[obj.name_full] = digest
+            if mesh_data:
+                if digest not in assets:
+                    assets[digest] = len(shapes)
+                    shapes.append(("SPHERE", radius))
+                instances.append(assets[digest])
+                corners.append(np.array([[(radius if i & (1 << k) else -radius) for k in range(3)] + [1] for i in range(8)]).T)
+            continue
         mesh = evaluated.to_mesh()
         try:
             mesh.calc_loop_triangles()
@@ -70,14 +82,14 @@ def geometry(objects, graph, *, mesh_data=True):
             hashes[obj.name_full] = digest
             if mesh_data:
                 if digest not in assets:
-                    assets[digest] = len(meshes)
-                    meshes.append((vertices, indices.reshape(-1, 3)))
+                    assets[digest] = len(shapes)
+                    shapes.append(("MESH", (vertices, indices.reshape(-1, 3))))
                 instances.append(assets[digest])
                 lower, upper = vertices.min(axis=0), vertices.max(axis=0)
                 corners.append(np.array([[upper[k] if i & (1 << k) else lower[k] for k in range(3)] + [1] for i in range(8)]).T)
         finally:
             evaluated.to_mesh_clear()
-    return {"meshes": meshes, "instances": instances}, corners, hashes
+    return {"shapes": shapes, "instances": instances}, corners, hashes
 
 
 def settings_key(scene):
@@ -165,7 +177,7 @@ def signature(scene, dependencies, hashes):
             else:
                 value[path] = [None if (path, i) in animated else v for i, v in enumerate(data)]
         if obj.name_full in hashes:
-            value["mesh"] = hashes[obj.name_full]
+            value["geometry"] = hashes[obj.name_full]
         if relevant_actions:
             action = animation.action if (animation.action, animation.action_slot_handle) in relevant_actions else None
             value["animation"] = (action.name_full if action else None, animation.action_slot_handle if action else None,

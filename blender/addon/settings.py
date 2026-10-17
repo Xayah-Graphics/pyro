@@ -23,8 +23,8 @@ CONFIG = {
 }
 OBJECT_INPUTS = {
     "NONE": (),
-    "EMITTER": ("role", "active", "smoke_rate", "temperature_rate", "velocity_rate", "velocity", "velocity_space", "inherit_velocity"),
-    "COLLIDER": ("role", "active", "surface_offset"),
+    "EMITTER": ("role", "geometry_type", "sphere_radius", "active", "smoke_rate", "temperature_rate", "velocity_rate", "velocity", "velocity_space", "inherit_velocity"),
+    "COLLIDER": ("role", "geometry_type", "sphere_radius", "active", "surface_offset"),
 }
 
 
@@ -74,7 +74,9 @@ def output_changed(self, context):
 
 
 class PYRO_PG_object(bpy.types.PropertyGroup):
-    role: bpy.props.EnumProperty(name="Pyro Role", items=[("NONE", "None", "No simulation role; keep the mesh"), ("EMITTER", "Source", "Emit inside this closed mesh"), ("COLLIDER", "Collider", "One-way solid boundary")], options=set(), update=input_changed)
+    role: bpy.props.EnumProperty(name="Pyro Role", items=[("NONE", "None", "No simulation role; keep the mesh"), ("EMITTER", "Source", "Emit inside the geometry"), ("COLLIDER", "Collider", "One-way solid boundary")], options=set(), update=input_changed)
+    geometry_type: bpy.props.EnumProperty(name="Geometry", items=[("MESH", "Mesh", "Use the evaluated triangle mesh"), ("SPHERE", "Sphere", "Analytic sphere centered at the object origin; use constant uniform scale and rigid motion")], options=set(), update=input_changed)
+    sphere_radius: bpy.props.FloatProperty(name="Radius", description="Analytic sphere radius in object space; the display mesh does not define the simulation surface", default=0.5, min=0.0001, subtype="DISTANCE", options=set(), update=input_changed)
     active: bpy.props.BoolProperty(name="Active", description="Participate in simulation at this time; can be keyframed independently of render visibility", default=True, update=lambda self, context: object_input_changed(self, "active"))
 
     smoke_rate: bpy.props.FloatProperty(name="Smoke Rate", description="Smoke density added per second inside the source", default=1, min=0, update=lambda self, context: object_input_changed(self, "smoke_rate"))
