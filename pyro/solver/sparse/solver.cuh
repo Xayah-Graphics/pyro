@@ -71,6 +71,7 @@ namespace pyro::sparse {
         ::cuda::buffer<std::byte, ::cuda::mr::device_accessible> sort_storage;
         ::cuda::buffer<SourceView, ::cuda::mr::device_accessible> source_storage;
         ::cuda::buffer<ColliderView, ::cuda::mr::device_accessible> collider_storage;
+        ::cuda::buffer<float, ::cuda::mr::device_accessible> source_weight_storage;
 
         ::cuda::buffer<DensityBlock, ::cuda::mr::host_accessible> host_output;
         ::cuda::buffer<DensityBlock, ::cuda::mr::device_accessible> density_storage;
@@ -81,6 +82,7 @@ namespace pyro::sparse {
         std::vector<::geometry::InstanceView> source_instances;
         std::vector<::geometry::InstanceView> collider_instances;
         bool geometry_dirty{true};
+        bool source_weights_dirty{true};
         int substep{};
         bool topology_dirty{true};
 

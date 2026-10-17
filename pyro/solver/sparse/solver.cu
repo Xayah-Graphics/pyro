@@ -36,6 +36,7 @@ namespace pyro::sparse {
           sort_storage(stream, pool.as_ref()),
           source_storage(stream, pool.as_ref()),
           collider_storage(stream, pool.as_ref()),
+          source_weight_storage(stream, pool.as_ref()),
           host_output(stream, host_pool.as_ref()),
           density_storage(stream, pool.as_ref()) {
         reserve(config.initial_blocks);
@@ -129,7 +130,17 @@ namespace pyro::sparse {
                 advect(grid, destination, carrier, config.grid.cell_size, config.grid.wind, static_cast<float>(time), stage_step, stream);
                 finish(statistics.advection_milliseconds);
                 start();
-                forces(grid, destination, carrier, config.forces, source_storage.data(), std::span<const Source>(sources), static_cast<float>(time), stage_step, stream);
+                const float* weights = nullptr;
+                if (source_count && std::ranges::all_of(source_instances, [](const auto& source) { return !source.moving; })) {
+                    if (source_weights_dirty) {
+                        auto count = sources.size() * grid.layout.capacity * 2240ull;
+                        if (source_weight_storage.size() < count) source_weight_storage = ::cuda::make_buffer<float>(stream, pool.as_ref(), count, ::cuda::no_init);
+                        sample_sources(grid, source_storage.data(), source_count, static_cast<float>(time), source_weight_storage.data(), stream);
+                        source_weights_dirty = false;
+                    }
+                    weights = source_weight_storage.data();
+                }
+                forces(grid, destination, carrier, config.forces, source_storage.data(), std::span<const Source>(sources), weights, static_cast<float>(time), stage_step, stream);
                 finish(statistics.forces_milliseconds);
                 if (grid.boundary_mode == BoundaryMode::moving) {
                     start();
@@ -239,7 +250,7 @@ namespace pyro::sparse {
             source_instances.clear();
             collider_instances.clear();
             prepare_inputs(0);
-            geometry_dirty = pressure.matrix_dirty = true;
+            geometry_dirty = pressure.matrix_dirty = pressure.topology_dirty = true;
             topology_dirty                         = false;
         }
     }
@@ -270,6 +281,7 @@ namespace pyro::sparse {
                 upload[i]          = {scene.prepared[sources[i].instance], source.velocity, source.smoke_rate, source.temperature_rate, source.velocity_rate, source.start_time, source.end_time, source.inherit_velocity};
             }
             if (count) ::cuda::copy_bytes(stream, ::cuda::std::span(upload.data(), static_cast<std::size_t>(count)), ::cuda::std::span(source_storage.data(), static_cast<std::size_t>(count)), {.src_access_order = ::cuda::source_access_order::during_api_call});
+            source_weights_dirty = true;
             source_inputs = sources;
             source_instances.resize(sources.size());
             for (std::size_t i = 0; i < sources.size(); ++i) source_instances[i] = scene.prepared[sources[i].instance];
@@ -389,6 +401,7 @@ namespace pyro::sparse {
         }
         scratch.count = index++;
         pressure.reserve(grid.layout);
+        source_weights_dirty = true;
         auto retain = [&](auto* source, auto* destination, std::size_t count) {
             if (count) ::cuda::copy_bytes(stream, ::cuda::std::span(source, count), ::cuda::std::span(destination, count), {.src_access_order = ::cuda::source_access_order::stream});
         };
@@ -434,7 +447,8 @@ namespace pyro::sparse {
             update_geometry(spare, collider_storage.data(), collider_count, time, 0, stream);
             remap(grid, spare, config.grid.wind, stream);
             std::swap(grid, spare);
-            pressure.matrix_dirty = true;
+            pressure.matrix_dirty = pressure.topology_dirty = true;
+            source_weights_dirty = true;
         } else if (grid.layout.count) ::cuda::copy_bytes(stream, ::cuda::std::span(spare.layout.blocks, static_cast<std::size_t>(grid.layout.count)), ::cuda::std::span(grid.layout.blocks, static_cast<std::size_t>(grid.layout.count)), {.src_access_order = ::cuda::source_access_order::stream});
         return changed;
     }

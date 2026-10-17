@@ -7,6 +7,8 @@
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
+#include <cub/device/device_reduce.cuh>
+#include <cuda/std/functional>
 #include <cuda/algorithm>
 #include <cuda/launch>
 #include <cuda/std/span>
@@ -359,10 +361,11 @@ namespace pyro::sparse {
     }
 
     unsigned long long scratch_bytes(Scratch scratch, ::cuda::stream_ref stream) {
-        std::size_t sort_bytes = 0, unique_bytes = 0;
+        std::size_t sort_bytes = 0, unique_bytes = 0, reduce_bytes = 0;
         if (auto cuda_result = cub::DeviceRadixSort::SortPairs(nullptr, sort_bytes, scratch.keys[0], scratch.keys[1], scratch.values[0], scratch.values[1], scratch.capacity, 0, 64, stream.get()); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
         if (auto cuda_result = cub::DeviceSelect::Unique(nullptr, unique_bytes, scratch.keys[1], scratch.keys[2], scratch.count, scratch.capacity, stream.get()); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
-        return std::max(sort_bytes, unique_bytes);
+        if (auto cuda_result = cub::DeviceReduce::ReduceByKey(nullptr, reduce_bytes, scratch.keys[1], scratch.keys[2], scratch.values[1], scratch.values[0], scratch.count, ::cuda::std::plus<double>{}, scratch.capacity, stream.get()); cuda_result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(cuda_result));
+        return std::max({sort_bytes, unique_bytes, reduce_bytes});
     }
 
     void rebuild_hash(Layout layout, ::cuda::stream_ref stream) {

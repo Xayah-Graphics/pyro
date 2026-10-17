@@ -16,6 +16,8 @@ namespace pyro::sparse {
         float dissipation{0.01f};
     };
 
-    void forces(Grid grid, Fields destination, Fields carrier, ForcesConfig config, const SourceView* sources, std::span<const Source> inputs, float time, float dt, ::cuda::stream_ref stream);
+    void sample_sources(Grid grid, const SourceView* sources, int count, float time, float* weights, ::cuda::stream_ref stream);
+
+    void forces(Grid grid, Fields destination, Fields carrier, ForcesConfig config, const SourceView* sources, std::span<const Source> inputs, const float* weights, float time, float dt, ::cuda::stream_ref stream);
 }
 #endif

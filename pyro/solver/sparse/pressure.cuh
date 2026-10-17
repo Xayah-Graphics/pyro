@@ -32,7 +32,9 @@ namespace pyro::sparse {
         int* children{};
         Edge* edges{};
         float* face_weights{};
+        unsigned char* regular{};
         int* adjacency{};
+        float* adjacency_weights{};
         float* boundary{};
         float* diagonal{};
         float* rhs{};
@@ -48,6 +50,7 @@ namespace pyro::sparse {
         double previous_rz{};
         double denominator{};
         double initial_norm{};
+        double initial_scale{};
         float max_residual{};
         int iterations{};
         int converged{};
@@ -56,6 +59,7 @@ namespace pyro::sparse {
 
     struct PressureView {
         int level_count{};
+        PressureLevel* levels{};
         double* solution{};
         float* residual{};
         float* direction{};
@@ -73,6 +77,12 @@ namespace pyro::sparse {
         const PressureConfig config;
         PressureView view;
         bool matrix_dirty{true};
+        bool topology_dirty{true};
+        bool solution_valid{};
+        int projection_count{};
+        int matrix_build_count{};
+        int topology_build_count{};
+        int graph_build_count{};
 
         Pressure(PressureConfig settings, ::cuda::stream_ref stream, ::cuda::device_memory_pool_ref pool);
 
@@ -86,6 +96,7 @@ namespace pyro::sparse {
 
         std::unique_ptr<std::remove_pointer_t<cudaGraphExec_t>, decltype(&cudaGraphExecDestroy)> iteration_graph;
         ::cuda::buffer<IterationState, ::cuda::mr::device_accessible> iteration_storage;
+        ::cuda::buffer<PressureLevel, ::cuda::mr::device_accessible> level_storage;
 
         std::array<PressureLevel, 32> hierarchy{};
         ::cuda::buffer<Node, ::cuda::mr::device_accessible> node_storage;

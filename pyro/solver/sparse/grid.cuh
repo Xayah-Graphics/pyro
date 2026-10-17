@@ -330,8 +330,7 @@ namespace pyro::sparse {
     }
 
     template <bool bounds = false>
-    __device__ inline float sample(Grid grid, Fields fields, float3 p, int field, float background = 0, float* lower = nullptr, float* upper = nullptr) {
-        int anchor = locate(grid.layout, p);
+    __device__ inline float sample(Grid grid, Fields fields, float3 p, int field, int anchor, float background = 0, float* lower = nullptr, float* upper = nullptr) {
         if (anchor >= 0) {
             bool uniform;
             float value = native_sample<bounds, true>(grid, fields, p, field, anchor, lower, upper, &uniform);
@@ -368,7 +367,8 @@ namespace pyro::sparse {
     }
 
     __device__ inline float3 sample_velocity(Grid grid, Fields fields, float3 p, float3 wind) {
-        return {sample(grid, fields, p, 0, wind.x), sample(grid, fields, p, 1, wind.y), sample(grid, fields, p, 2, wind.z)};
+        int anchor = locate(grid.layout, p);
+        return {sample(grid, fields, p, 0, anchor, wind.x), sample(grid, fields, p, 1, anchor, wind.y), sample(grid, fields, p, 2, anchor, wind.z)};
     }
 
     unsigned long long scratch_bytes(Scratch scratch, ::cuda::stream_ref stream);

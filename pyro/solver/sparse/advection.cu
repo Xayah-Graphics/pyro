@@ -52,10 +52,12 @@ namespace pyro::sparse {
         bool clipped, reverse_clipped = true;
         float3 departure = trace<boundary_mode>(grid, carrier, cell_size, wind, p, time + dt, dt, clipped), reverse{};
         if (correct && !clipped) reverse = trace<boundary_mode>(grid, carrier, cell_size, wind, p, time, -dt, reverse_clipped);
+        int departure_anchor = locate(grid.layout, departure);
+        int reverse_anchor = correct && !clipped && !reverse_clipped ? locate(grid.layout, reverse) : -1;
 #pragma unroll
         for (int field = 3; field < 5; ++field) {
-            float lo, hi, value = sample<correct>(grid, grid.state, departure, field, 0, &lo, &hi);
-            if (correct && !clipped && !reverse_clipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field))));
+            float lo, hi, value = sample<correct>(grid, grid.state, departure, field, departure_anchor, 0, &lo, &hi);
+            if (correct && !clipped && !reverse_clipped) value = fminf(hi, fmaxf(lo, value + .5f * ((field == 3 ? grid.state.smoke[i] : grid.state.temperature[i]) - sample(grid, grid.transported, reverse, field, reverse_anchor))));
             (field == 3 ? destination.smoke : destination.temperature)[i] = value;
         }
     }
@@ -80,10 +82,10 @@ namespace pyro::sparse {
             }
         bool clipped;
         float3 departure = trace<boundary_mode>(grid, carrier, cell_size, wind, p, time + dt, dt, clipped);
-        float lo, hi, value = sample<correct>(grid, grid.state, departure, axis, (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z), &lo, &hi);
+        float lo, hi, value = sample<correct>(grid, grid.state, departure, axis, locate(grid.layout, departure), (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z), &lo, &hi);
         if (correct && !clipped) {
             float3 reverse = trace<boundary_mode>(grid, carrier, cell_size, wind, p, time, -dt, clipped);
-            if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z)))));
+            if (!clipped) value = fminf(hi, fmaxf(lo, value + .5f * (grid.state.velocity[f] - sample(grid, grid.transported, reverse, axis, locate(grid.layout, reverse), (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z)))));
         }
         destination.velocity[f] = value;
     }
