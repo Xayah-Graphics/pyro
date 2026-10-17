@@ -88,6 +88,7 @@ namespace pyro::sparse {
         Fields midpoint;
         Fields next;
         Fields transported;
+        Fields upper;
         float* samples[3]{};
         unsigned char* uniform_samples{};
         float* distance[3]{};

@@ -331,7 +331,7 @@ namespace pyro::sparse {
         auto face_data      = ::cuda::make_buffer<Face>(stream, pool.as_ref(), faces * 2, ::cuda::no_init);
         auto links          = ::cuda::make_buffer<Links>(stream, pool.as_ref(), capacity * 384ull * 2, ::cuda::no_init);
         auto masks          = ::cuda::make_buffer<unsigned char>(stream, pool.as_ref(), cells * 2 + samples, ::cuda::no_init);
-        auto fields         = ::cuda::make_buffer<float>(stream, pool.as_ref(), 5 * (cells * 2 + faces) + cells * 2 + distances * 6 + samples * 3 + scratch_capacity * 2ull, ::cuda::no_init);
+        auto fields         = ::cuda::make_buffer<float>(stream, pool.as_ref(), 6 * (cells * 2 + faces) + cells * 2 + distances * 6 + samples * 3 + scratch_capacity * 2ull, ::cuda::no_init);
         ::cuda::fill_bytes(stream, blocks, 0);
         ::cuda::fill_bytes(stream, keys, 0);
         ::cuda::fill_bytes(stream, indices, 0);
@@ -376,6 +376,12 @@ namespace pyro::sparse {
             grid.samples[i] = spare.samples[i] = field;
             field += samples;
         }
+        grid.upper.smoke = spare.upper.smoke = field;
+        field += cells;
+        grid.upper.temperature = spare.upper.temperature = field;
+        field += cells;
+        grid.upper.velocity = spare.upper.velocity = field;
+        field += faces;
         grid.uniform_samples = spare.uniform_samples = masks.data() + cells * 2;
         topology.roots                               = keys.data() + table_size * 2ull;
         topology.refine                              = keys.data() + table_size * 3ull;

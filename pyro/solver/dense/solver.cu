@@ -32,7 +32,7 @@ namespace pyro::dense {
         grid.origin   = config.origin;
         grid.layout   = pressure.hierarchy[0].layout;
         auto cells    = static_cast<std::size_t>(grid.layout.cells);
-        field_storage = ::cuda::make_buffer<float>(stream, pool.as_ref(), cells * 29 + 2, ::cuda::no_init);
+        field_storage = ::cuda::make_buffer<float>(stream, pool.as_ref(), cells * 34 + 2, ::cuda::no_init);
         mask_storage  = ::cuda::make_buffer<unsigned char>(stream, pool.as_ref(), cells * 2, ::cuda::no_init);
         ::cuda::fill_bytes(stream, field_storage.first(cells * 10), 0);
         ::cuda::fill_bytes(stream, mask_storage, 0);
@@ -57,10 +57,17 @@ namespace pyro::dense {
         pressure.view.direction = cursor;
         pressure.view.product   = cursor + cells;
         pressure.view.residual  = cursor + cells * 3;
-        maximum                 = cursor + cells * 4;
+        maximum                 = cursor + cells * 9;
         ::cuda::fill_bytes(stream, ::cuda::std::span(maximum, 2), 0);
         grid.transported      = {{pressure.view.direction, pressure.view.product, cursor + cells * 2}, pressure.view.residual, pressure.hierarchy[0].solution};
         pressure.view.anchors = mask_storage.data() + cells;
+        auto* upper = cursor + cells * 4;
+        for (auto& velocity : grid.upper.velocity) {
+            velocity = upper;
+            upper += cells;
+        }
+        grid.upper.smoke = upper;
+        grid.upper.temperature = upper + cells;
         initialize_grid(grid, config.wind, stream);
         stream.sync();
     }

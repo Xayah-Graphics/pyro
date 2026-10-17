@@ -44,12 +44,16 @@ namespace pyro::dense {
 
     struct PressureView {
         int level_count{};
+        int anchor_count{};
         float* direction{};
         float* product{};
         double* solution{};
+        double* rhs{};
+        double* closed_residual{};
+        double* closed_product{};
         float* residual{};
         int* parents{};
-        int* open_components{};
+        int* anchor_indices{};
         unsigned char* anchors{};
         double* reductions{};
         IterationState* iteration{};
@@ -74,6 +78,7 @@ namespace pyro::dense {
 
         ::cuda::buffer<int, ::cuda::mr::device_accessible> index_storage;
         ::cuda::buffer<double, ::cuda::mr::device_accessible> reduction_storage;
+        ::cuda::buffer<double, ::cuda::mr::device_accessible> closed_storage;
         std::vector<::cuda::buffer<float, ::cuda::mr::device_accessible>> level_storage;
     };
 }

@@ -169,6 +169,9 @@ int main(int argc, char** argv) try {
         auto anchors          = download(solver.pressure.view.anchors);
         auto potential        = download(solver.pressure.view.solution);
         auto rhs              = download(solver.pressure.hierarchy[0].rhs);
+        auto exact_rhs        = solver.pressure.view.anchor_count ? download(solver.pressure.view.rhs) : std::vector<double>{};
+        auto parents          = solver.pressure.view.anchor_count ? download(solver.pressure.view.parents) : std::vector<int>{};
+        std::vector<double> component_rhs(solver.pressure.view.anchor_count ? cells : 0);
         auto boundary         = download(solver.pressure.hierarchy[0].boundary);
         auto solid_divergence = download(solver.grid.solid_divergence);
         std::array<std::vector<float>, 3> velocity, aperture, solid_velocity, face;
@@ -198,14 +201,18 @@ int main(int argc, char** argv) try {
                         product += static_cast<double>(face[axis][right]) * (potential[i] - potential[right]);
                     }
                     double divergence = flux / config.cell_size - (solver.grid.boundary_mode == pyro::BoundaryMode::moving ? solid_divergence[i] : 0);
-                    double residual   = rhs[i] - product;
+                    double right_hand_side = exact_rhs.empty() ? rhs[i] : anchors[i] ? 0 : exact_rhs[i];
+                    double residual   = right_hand_side - product;
                     max_divergence    = std::max(max_divergence, std::isfinite(divergence) ? std::abs(divergence) : INFINITY);
                     max_residual      = std::max(max_residual, std::isfinite(residual) ? std::abs(residual) : INFINITY);
                     squared_residual += residual * residual;
-                    squared_rhs += static_cast<double>(rhs[i]) * rhs[i];
+                    squared_rhs += right_hand_side * right_hand_side;
+                    if (!exact_rhs.empty() && anchors[parents[i]]) component_rhs[parents[i]] += exact_rhs[i];
                     anchor_count += anchors[i] != 0;
                 }
-        std::cerr << std::setprecision(12) << "{\"cpu_divergence\":" << max_divergence << ",\"cpu_true_residual\":" << max_residual << ",\"relative_l2_residual\":" << std::sqrt(squared_residual / squared_rhs) << ",\"anchors\":" << anchor_count << "}\n";
+        double rhs_imbalance = 0;
+        for (std::size_t i = 0; i < component_rhs.size(); ++i) if (anchors[i]) rhs_imbalance = std::max(rhs_imbalance, std::abs(component_rhs[i]));
+        std::cerr << std::setprecision(12) << "{\"cpu_divergence\":" << max_divergence << ",\"cpu_true_residual\":" << max_residual << ",\"relative_l2_residual\":" << std::sqrt(squared_residual / squared_rhs) << ",\"anchors\":" << anchor_count << ",\"closed_rhs_imbalance\":" << rhs_imbalance << "}\n";
         if (!std::isfinite(max_divergence) || max_divergence > config.pressure.divergence_tolerance || max_residual > config.pressure.divergence_tolerance * .5) throw std::runtime_error("CPU projection audit failed");
     }
     if (!snapshot.empty()) {

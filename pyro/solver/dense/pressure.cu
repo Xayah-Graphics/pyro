@@ -42,15 +42,16 @@ namespace pyro::dense {
         return value;
     }
 
-    template <bool regular, typename T>
-    __device__ T matrix_product(PressureLevel level, const T* x, int i) {
+    template <bool regular, typename T, typename R = T>
+    __device__ R matrix_product(PressureLevel level, const T* x, int i) {
         if (level.diagonal[i] <= 0.0f) return 0.0f;
-        T result = (regular ? .5f : 1.f) * level.boundary[i] * x[i];
+        T center = x[i];
+        R result = (regular ? .5f : 1.f) * level.boundary[i] * center;
 #pragma unroll
         for (int axis = 0; axis < 3; ++axis) {
             int stride = axis == 0 ? 1 : axis == 1 ? level.layout.pitch : level.layout.slice;
-            result += (regular ? level.constant_coefficient : level.face[axis][i]) * (x[i] - x[i - stride]);
-            result += (regular ? level.constant_coefficient : level.face[axis][i + stride]) * (x[i] - x[i + stride]);
+            result += static_cast<R>((regular ? level.constant_coefficient : level.face[axis][i]) * (center - x[i - stride]));
+            result += static_cast<R>((regular ? level.constant_coefficient : level.face[axis][i + stride]) * (center - x[i + stride]));
         }
         return result;
     }
@@ -198,10 +199,11 @@ namespace pyro::dense {
         }
     }
 
-    __global__ void anchor_faces(PressureLevel level, const unsigned char* anchors) {
+    __global__ void anchor_faces(PressureLevel level, const unsigned char* anchors, int* indices, IterationState* state) {
         int id = static_cast<int>(blockIdx.x);
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i = id * tile_cells + local;
+            if (anchors[i]) indices[atomicAdd(&state->iterations, 1)] = i;
 #pragma unroll
             for (int axis = 0; axis < 3; ++axis) {
                 int j = neighbor(level.layout, i, axis, -1);
@@ -213,6 +215,48 @@ namespace pyro::dense {
                 }
             }
         }
+    }
+
+    template <BoundaryMode boundary_mode>
+    __global__ void closed_rhs(Grid grid, Fields fields, float h, PressureLevel level, PressureView workspace) {
+        for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
+            int i = blockIdx.x * tile_cells + local;
+            double divergence = boundary_mode == BoundaryMode::moving ? -static_cast<double>(grid.solid_divergence[i]) : 0;
+#pragma unroll
+            for (int axis = 0; axis < 3; ++axis) {
+                int stride = axis == 0 ? 1 : axis == 1 ? grid.layout.pitch : grid.layout.slice;
+                int right = i + stride;
+                if (!grid.fluid[i]) break;
+                double a = grid.aperture[axis][i], b = grid.aperture[axis][right];
+                double flux = b * fields.velocity[axis][right] - a * fields.velocity[axis][i];
+                if constexpr (boundary_mode == BoundaryMode::moving) flux += (1 - b) * grid.solid_velocity[axis][right] - (1 - a) * grid.solid_velocity[axis][i];
+                divergence += flux / h;
+            }
+            workspace.rhs[i] = grid.fluid[i] ? -divergence : 0;
+            double r = grid.fluid[i] && !workspace.anchors[i] ? -divergence : 0;
+            workspace.closed_residual[i] = r;
+            workspace.residual[i] = static_cast<float>(r);
+            level.rhs[i] = static_cast<float>(r);
+        }
+    }
+
+    __global__ void reference_residual(Grid grid, float h, PressureView workspace) {
+        if (workspace.iteration->converged || workspace.iteration->failed) return;
+        double largest = 0;
+        for (int index = threadIdx.x; index < workspace.anchor_count; index += blockDim.x) {
+            int i = workspace.anchor_indices[index];
+            double r = workspace.rhs[i];
+#pragma unroll
+            for (int axis = 0; axis < 3; ++axis) {
+                int stride = axis == 0 ? 1 : axis == 1 ? grid.layout.pitch : grid.layout.slice;
+                int left = i - stride, right = i + stride;
+                r -= static_cast<double>(grid.aperture[axis][i]) * (workspace.solution[i] - workspace.solution[left]) / (static_cast<double>(h) * h);
+                r -= static_cast<double>(grid.aperture[axis][right]) * (workspace.solution[i] - workspace.solution[right]) / (static_cast<double>(h) * h);
+            }
+            largest = fmax(largest, fabs(r));
+        }
+        largest = block_maximum(largest);
+        if (!threadIdx.x) workspace.reductions[grid.layout.blocks * 2] = largest;
     }
 
     __global__ void coarsen_matrix(PressureLevel fine, PressureLevel coarse) {
@@ -449,7 +493,7 @@ namespace pyro::dense {
         }
     }
 
-    template <DotOperation operation>
+    template <DotOperation operation, bool closed = false>
     __global__ void finish_dot(double* partial, int count, IterationState* state, float relative_tolerance, float absolute_tolerance) {
         if (state->converged || state->failed) return;
         constexpr bool maximum = operation == DotOperation::initial_norm || operation == DotOperation::residual_norm || operation == DotOperation::iteration_norm;
@@ -461,6 +505,7 @@ namespace pyro::dense {
         sum = block_sum(sum);
         if constexpr (maximum) largest = block_maximum(largest);
         if (threadIdx.x) return;
+        if constexpr (maximum && closed) largest = fmax(largest, partial[count * 2]);
         if constexpr (operation == DotOperation::iteration_norm) ++state->iterations;
         if (!isfinite(sum)) {
             state->failed = 1;
@@ -504,8 +549,8 @@ namespace pyro::dense {
         }
     }
 
-    template <bool first>
-    __global__ void search_direction(PressureLevel level, float* direction, const IterationState* state, int maximum, cudaGraphConditionalHandle condition) {
+    template <bool first, bool closed = false>
+    __global__ void search_direction(PressureLevel level, float* direction, const IterationState* state, int maximum, cudaGraphConditionalHandle condition, const unsigned char* anchors) {
         if constexpr (!first)
             if (!blockIdx.x && !threadIdx.x) cudaGraphSetConditional(condition, !state->converged && !state->failed && state->iterations < maximum);
         if (state->converged || state->failed) return;
@@ -514,34 +559,45 @@ namespace pyro::dense {
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i        = id * tile_cells + local;
             direction[i] = first ? level.solution[i] : level.solution[i] + beta * direction[i];
+            if constexpr (closed) if (anchors[i]) direction[i] = 0;
         }
     }
 
-    template <bool regular>
-    __global__ void apply_matrix(PressureLevel level, const float* direction, float* product, double* partial, const IterationState* state) {
+    template <bool regular, bool closed = false>
+    __global__ void apply_matrix(PressureLevel level, const float* direction, float* product, double* partial, const IterationState* state, double* closed_product) {
         if (state->converged || state->failed) return;
         double sum = 0.0;
         int id     = static_cast<int>(blockIdx.x);
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i        = id * tile_cells + local;
-            float result = matrix_product<regular>(level, direction, i);
-            product[i]   = result;
+            auto result = matrix_product<regular, float, std::conditional_t<closed, double, float>>(level, direction, i);
+            if constexpr (closed) closed_product[i] = result;
+            else product[i] = result;
             sum += static_cast<double>(direction[i]) * static_cast<double>(result);
         }
         sum = block_sum(sum);
         if (!threadIdx.x) partial[blockIdx.x] = sum;
     }
 
-    __global__ void update_iterate(PressureLevel level, double* solution, float* residual, const float* direction, const float* product, double* partial, IterationState* state) {
+    template <bool closed>
+    __global__ void update_iterate(PressureLevel level, double* solution, float* residual, const float* direction, const float* product, double* partial, IterationState* state, double* closed_residual, const double* closed_product) {
         if (state->converged || state->failed) return;
         double sum    = 0.0;
         float largest = 0.0f;
         int id        = static_cast<int>(blockIdx.x);
-        float alpha   = static_cast<float>(state->rz / state->denominator);
+        std::conditional_t<closed, double, float> alpha = static_cast<std::conditional_t<closed, double, float>>(state->rz / state->denominator);
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i = id * tile_cells + local;
-            solution[i] += static_cast<double>(alpha) * direction[i];
-            float r     = residual[i] - alpha * product[i];
+            float r;
+            if constexpr (closed) {
+                solution[i] += alpha * direction[i];
+                double next = closed_residual[i] - alpha * closed_product[i];
+                closed_residual[i] = next;
+                r = static_cast<float>(next);
+            } else {
+                solution[i] += static_cast<double>(alpha) * direction[i];
+                r = residual[i] - alpha * product[i];
+            }
             residual[i] = r;
             sum += static_cast<double>(r) * static_cast<double>(r);
             largest = fmaxf(largest, fabsf(r));
@@ -554,13 +610,15 @@ namespace pyro::dense {
         }
     }
 
-    template <BoundaryMode boundary_mode>
-    __global__ void true_residual(PressureLevel level, Grid grid, Fields fields, float h, const unsigned char* anchors, const double* solution, float* residual, double* partial) {
+    template <BoundaryMode boundary_mode, bool closed>
+    __global__ void true_residual(PressureLevel level, Grid grid, Fields fields, float h, const unsigned char* anchors, const double* solution, float* residual, double* partial, const double* rhs, double* closed_residual) {
         double sum    = 0;
         float largest = 0;
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i       = blockIdx.x * tile_cells + local;
-            float r     = level.rhs[i] - matrix_product<boundary_mode == BoundaryMode::none>(level, solution, i);
+            double exact = (closed ? (anchors[i] ? 0 : rhs[i]) : level.rhs[i]) - matrix_product<boundary_mode == BoundaryMode::none>(level, solution, i);
+            if constexpr (closed) closed_residual[i] = exact;
+            float r = static_cast<float>(exact);
             residual[i] = r;
             if constexpr (boundary_mode != BoundaryMode::none) {
                 if (anchors[i]) {
@@ -657,23 +715,30 @@ namespace pyro::dense {
         }
     }
 
-    void assemble_pressure(std::span<const PressureLevel> levels, Grid grid, Fields fields, PressureView workspace, float h, bool rebuild, ::cuda::stream_ref stream) {
+    void assemble_pressure(std::span<const PressureLevel> levels, Grid grid, Fields fields, PressureView& workspace, float h, bool rebuild, ::cuda::stream_ref stream) {
         auto fine   = levels[0];
         int count   = fine.layout.blocks;
+        int* open_components = workspace.anchor_indices;
         auto launch = [&]<BoundaryMode boundary_mode>() {
-            if (rebuild) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), assemble_fine<true, boundary_mode>, grid, fields, fine, h, workspace.parents, workspace.open_components, workspace.anchors, workspace.solution, workspace.residual);
-            else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), assemble_fine<false, boundary_mode>, grid, fields, fine, h, workspace.parents, workspace.open_components, workspace.anchors, workspace.solution, workspace.residual);
+            if (rebuild) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), assemble_fine<true, boundary_mode>, grid, fields, fine, h, workspace.parents, open_components, workspace.anchors, workspace.solution, workspace.residual);
+            else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), assemble_fine<false, boundary_mode>, grid, fields, fine, h, workspace.parents, open_components, workspace.anchors, workspace.solution, workspace.residual);
         };
         switch (grid.boundary_mode) {
         case BoundaryMode::none: launch.template operator()<BoundaryMode::none>(); break;
         case BoundaryMode::stationary: launch.template operator()<BoundaryMode::stationary>(); break;
         case BoundaryMode::moving: launch.template operator()<BoundaryMode::moving>(); break;
         }
+        if (rebuild) workspace.anchor_count = 0;
         if (grid.boundary_mode != BoundaryMode::none && rebuild) {
+            ::cuda::fill_bytes(stream, ::cuda::std::span(workspace.iteration, 1), 0);
             ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), connect_components, fine, grid.fluid, workspace.parents);
-            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), mark_components, fine, workspace.parents, workspace.open_components);
-            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), anchor_components, fine, grid.fluid, workspace.parents, workspace.open_components, workspace.anchors, workspace.residual);
-            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), anchor_faces, fine, workspace.anchors);
+            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), mark_components, fine, workspace.parents, open_components);
+            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), anchor_components, fine, grid.fluid, workspace.parents, open_components, workspace.anchors, workspace.residual);
+            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), anchor_faces, fine, workspace.anchors, workspace.anchor_indices, workspace.iteration);
+            IterationState status{};
+            ::cuda::copy_bytes(stream, ::cuda::std::span(workspace.iteration, 1), ::cuda::std::span(&status, 1), {.src_access_order = ::cuda::source_access_order::stream});
+            stream.sync();
+            workspace.anchor_count = status.iterations;
         }
     }
 
@@ -681,34 +746,42 @@ namespace pyro::dense {
         ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(coarse.layout.blocks), ::cuda::block_dims<threads>()), coarsen_matrix, fine, coarse);
     }
 
-    void begin_pressure(std::span<const PressureLevel> levels, PressureView workspace, PressureConfig config, ::cuda::stream_ref stream) {
+    template <bool closed>
+    void begin_pressure(std::span<const PressureLevel> levels, Grid grid, float h, PressureView workspace, PressureConfig config, ::cuda::stream_ref stream) {
         auto fine = levels[0];
         int count = fine.layout.blocks;
         ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), dot_blocks<true>, fine, workspace.residual, workspace.residual, workspace.reductions, workspace.iteration);
-        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::initial_norm>, workspace.reductions, count, workspace.iteration, config.relative_tolerance, config.divergence_tolerance * 0.25f);
+        if constexpr (closed) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), reference_residual, grid, h, workspace);
+        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::initial_norm, closed>, workspace.reductions, count, workspace.iteration, config.relative_tolerance, config.divergence_tolerance * 0.25f);
         precondition(levels, workspace, stream);
         if (workspace.level_count == 1) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), dot_blocks<false>, fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration);
         ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::update_rz>, workspace.reductions, count, workspace.iteration, 0.0f, 0.0f);
-        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), search_direction<true>, fine, workspace.direction, workspace.iteration, config.max_iterations, cudaGraphConditionalHandle{});
+        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), search_direction<true, closed>, fine, workspace.direction, workspace.iteration, config.max_iterations, cudaGraphConditionalHandle{}, workspace.anchors);
     }
 
-    void iterate_pressure(std::span<const PressureLevel> levels, PressureView workspace, PressureConfig config, ::cuda::stream_ref stream, cudaGraphConditionalHandle condition) {
+    template <bool closed>
+    void iterate_pressure(std::span<const PressureLevel> levels, Grid grid, float h, PressureView workspace, PressureConfig config, ::cuda::stream_ref stream, cudaGraphConditionalHandle condition) {
         auto fine = levels[0];
         int count = fine.layout.blocks;
-        if (fine.constant_coefficient > 0) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), apply_matrix<true>, fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
-        else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), apply_matrix<false>, fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
+        if constexpr (closed) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), apply_matrix<false, true>, fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, workspace.closed_product);
+        else if (fine.constant_coefficient > 0) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), apply_matrix<true>, fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, nullptr);
+        else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), apply_matrix<false>, fine, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, nullptr);
         ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::denominator>, workspace.reductions, count, workspace.iteration, 0.0f, 0.0f);
-        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), update_iterate, fine, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.reductions, workspace.iteration);
-        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::iteration_norm>, workspace.reductions, count, workspace.iteration, config.relative_tolerance, config.divergence_tolerance * 0.25f);
+        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), update_iterate<closed>, fine, workspace.solution, workspace.residual, workspace.direction, workspace.product, workspace.reductions, workspace.iteration, workspace.closed_residual, workspace.closed_product);
+        if constexpr (closed) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), reference_residual, grid, h, workspace);
+        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::iteration_norm, closed>, workspace.reductions, count, workspace.iteration, config.relative_tolerance, config.divergence_tolerance * 0.25f);
         precondition(levels, workspace, stream);
         if (workspace.level_count == 1) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), dot_blocks<false>, fine, workspace.residual, fine.solution, workspace.reductions, workspace.iteration);
         ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims<1>(), ::cuda::block_dims<threads>()), finish_dot<DotOperation::update_rz>, workspace.reductions, count, workspace.iteration, 0.0f, 0.0f);
-        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), search_direction<false>, fine, workspace.direction, workspace.iteration, config.max_iterations, condition);
+        ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(count), ::cuda::block_dims<threads>()), search_direction<false, closed>, fine, workspace.direction, workspace.iteration, config.max_iterations, condition, workspace.anchors);
     }
 
     void check_pressure(std::span<const PressureLevel> levels, Grid grid, Fields fields, float h, PressureView workspace, PressureConfig config, ::cuda::stream_ref stream) {
         auto fine   = levels[0];
-        auto launch = [&]<BoundaryMode boundary_mode>() { ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(fine.layout.blocks), ::cuda::block_dims<threads>()), true_residual<boundary_mode>, fine, grid, fields, h, workspace.anchors, workspace.solution, workspace.residual, workspace.reductions); };
+        auto launch = [&]<BoundaryMode boundary_mode>() {
+            if (workspace.anchor_count) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(fine.layout.blocks), ::cuda::block_dims<threads>()), true_residual<boundary_mode, true>, fine, grid, fields, h, workspace.anchors, workspace.solution, workspace.residual, workspace.reductions, workspace.rhs, workspace.closed_residual);
+            else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(fine.layout.blocks), ::cuda::block_dims<threads>()), true_residual<boundary_mode, false>, fine, grid, fields, h, workspace.anchors, workspace.solution, workspace.residual, workspace.reductions, nullptr, nullptr);
+        };
         switch (grid.boundary_mode) {
         case BoundaryMode::none: launch.template operator()<BoundaryMode::none>(); break;
         case BoundaryMode::stationary: launch.template operator()<BoundaryMode::stationary>(); break;
@@ -731,7 +804,8 @@ namespace pyro::dense {
           iteration_graph(nullptr, cudaGraphExecDestroy),
           iteration_storage(::cuda::make_buffer<IterationState>(stream, pool, 1, ::cuda::no_init)),
           index_storage(stream, pool),
-          reduction_storage(stream, pool) {
+          reduction_storage(stream, pool),
+          closed_storage(stream, pool) {
         view.iteration = iteration_storage.data();
         ::cuda::fill_bytes(stream, iteration_storage, 0);
         hierarchy.resize(std::bit_width(static_cast<unsigned>(std::max({resolution.x, resolution.y, resolution.z}))));
@@ -767,7 +841,7 @@ namespace pyro::dense {
         ::cuda::fill_bytes(stream, index_storage, 0);
         ::cuda::fill_bytes(stream, reduction_storage, 0);
         view.parents         = index_storage.data();
-        view.open_components = index_storage.data() + cells;
+        view.anchor_indices = index_storage.data() + cells;
         view.solution        = reduction_storage.data();
         view.reductions      = reduction_storage.data() + cells;
     }
@@ -782,7 +856,9 @@ namespace pyro::dense {
             coefficient                = (n.x % 2 || n.y % 2 || n.z % 2 || n.x <= 1 || n.y <= 1 || n.z <= 1) ? 0 : coefficient * 2;
         }
         auto levels = std::span(hierarchy).first(view.level_count);
+        int previous_anchors = view.anchor_count;
         assemble_pressure(levels, grid, grid.state, view, h, true, stream);
+        if (previous_anchors != view.anchor_count) iteration_graph.reset();
         for (int l = 1; l < view.level_count; ++l) coarse_matrix(levels[l - 1], levels[l], stream);
         matrix_dirty = false;
     }
@@ -799,12 +875,26 @@ namespace pyro::dense {
         auto levels = std::span(hierarchy).first(view.level_count);
 
         auto& workspace = view;
+        int previous_anchors = workspace.anchor_count;
         assemble_pressure(levels, grid, fields, workspace, h, matrix_dirty, stream);
+        if (previous_anchors != workspace.anchor_count) iteration_graph.reset();
         if (matrix_dirty)
             for (int l = 1; l < workspace.level_count; ++l) coarse_matrix(levels[l - 1], levels[l], stream);
         matrix_dirty = false;
+        if (workspace.anchor_count) {
+            auto cells = static_cast<std::size_t>(grid.layout.cells);
+            if (closed_storage.empty()) {
+                closed_storage = ::cuda::make_buffer<double>(stream, reduction_storage.memory_resource(), cells * 3, ::cuda::no_init);
+                workspace.rhs = closed_storage.data();
+                workspace.closed_residual = closed_storage.data() + cells;
+                workspace.closed_product = closed_storage.data() + cells * 2;
+            }
+            if (grid.boundary_mode == BoundaryMode::moving) ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(grid.layout.blocks), ::cuda::block_dims<threads>()), closed_rhs<BoundaryMode::moving>, grid, fields, h, levels[0], workspace);
+            else ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(grid.layout.blocks), ::cuda::block_dims<threads>()), closed_rhs<BoundaryMode::stationary>, grid, fields, h, levels[0], workspace);
+        }
         ::cuda::fill_bytes(stream, ::cuda::std::span(workspace.iteration, 1), 0);
-        begin_pressure(levels, workspace, config, stream);
+        if (workspace.anchor_count) begin_pressure<true>(levels, grid, h, workspace, config, stream);
+        else begin_pressure<false>(levels, grid, h, workspace, config, stream);
         if (!iteration_graph) {
             cudaGraph_t captured{};
             if (auto result = cudaGraphCreate(&captured, 0); result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
@@ -820,7 +910,8 @@ namespace pyro::dense {
             if (auto result = cudaGraphAddNode(&loop, graph.get(), nullptr, nullptr, 0, &parameters); result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
             auto body = parameters.conditional.phGraph_out[0];
             if (auto result = cudaStreamBeginCaptureToGraph(stream.get(), body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal); result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
-            iterate_pressure(levels, workspace, config, stream, condition);
+            if (workspace.anchor_count) iterate_pressure<true>(levels, grid, h, workspace, config, stream, condition);
+            else iterate_pressure<false>(levels, grid, h, workspace, config, stream, condition);
             if (auto result = cudaStreamEndCapture(stream.get(), &body); result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
             cudaGraphExec_t executable{};
             if (auto result = cudaGraphInstantiate(&executable, graph.get(), 0); result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
@@ -841,7 +932,8 @@ namespace pyro::dense {
                 if (status.max_residual <= config.divergence_tolerance * 0.5f || status.failed || status.iterations >= config.max_iterations) break;
                 status.converged = 0;
                 ::cuda::copy_bytes(stream, ::cuda::std::span(&status, 1), ::cuda::std::span(workspace.iteration, 1), {.src_access_order = ::cuda::source_access_order::stream});
-                begin_pressure(levels, workspace, config, stream);
+                if (workspace.anchor_count) begin_pressure<true>(levels, grid, h, workspace, config, stream);
+                else begin_pressure<false>(levels, grid, h, workspace, config, stream);
             }
         }
         if (status.failed || status.max_residual > config.divergence_tolerance * 0.5f) throw std::runtime_error("Pressure solve failed: iterations=" + std::to_string(status.iterations) + ", true residual=" + std::to_string(status.max_residual));

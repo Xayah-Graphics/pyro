@@ -40,6 +40,7 @@ namespace pyro::dense {
         Fields midpoint;
         Fields next;
         Fields transported;
+        Fields upper;
     };
 
     __host__ __device__ inline bool interior(Layout layout, int3 p) {
