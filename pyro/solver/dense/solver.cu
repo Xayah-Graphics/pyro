@@ -32,7 +32,7 @@ namespace pyro::dense {
         grid.origin   = config.origin;
         grid.layout   = pressure.hierarchy[0].layout;
         auto cells    = static_cast<std::size_t>(grid.layout.cells);
-        field_storage = ::cuda::make_buffer<float>(stream, pool.as_ref(), cells * 34 + 2, ::cuda::no_init);
+        field_storage = ::cuda::make_buffer<float>(stream, pool.as_ref(), cells * 44 + 2, ::cuda::no_init);
         mask_storage  = ::cuda::make_buffer<unsigned char>(stream, pool.as_ref(), cells * 2, ::cuda::no_init);
         ::cuda::fill_bytes(stream, field_storage.first(cells * 10), 0);
         ::cuda::fill_bytes(stream, mask_storage, 0);
@@ -57,17 +57,19 @@ namespace pyro::dense {
         pressure.view.direction = cursor;
         pressure.view.product   = cursor + cells;
         pressure.view.residual  = cursor + cells * 3;
-        maximum                 = cursor + cells * 9;
+        maximum                 = cursor + cells * 19;
         ::cuda::fill_bytes(stream, ::cuda::std::span(maximum, 2), 0);
-        grid.transported      = {{pressure.view.direction, pressure.view.product, cursor + cells * 2}, pressure.view.residual, pressure.hierarchy[0].solution};
+        grid.transported      = {{pressure.view.direction, pressure.view.product, cursor + cells * 2}};
         pressure.view.anchors = mask_storage.data() + cells;
         auto* upper = cursor + cells * 4;
-        for (auto& velocity : grid.upper.velocity) {
+        for (auto& velocity : grid.velocity_scratch) {
             velocity = upper;
             upper += cells;
         }
-        grid.upper.smoke = upper;
-        grid.upper.temperature = upper + cells;
+        for (auto& scalar : grid.scalar_scratch) {
+            scalar = upper;
+            upper += cells * 6;
+        }
         initialize_grid(grid, config.wind, stream);
         stream.sync();
     }

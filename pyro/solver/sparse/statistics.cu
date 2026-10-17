@@ -12,7 +12,7 @@ namespace pyro::sparse {
         for (int local = threadIdx.x; local < 512; local += blockDim.x) {
             int i = b * 512 + local;
             if (!grid.fluid[i]) continue;
-            float div = boundary_mode == BoundaryMode::moving ? -grid.solid_divergence[i] : 0, velocity_squared = 0;
+            float div = boundary_mode == BoundaryMode::moving ? -grid.solid_divergence[i] : 0, velocity_bound = 0;
             if constexpr (full) {
                 double h = spacing(grid.layout, i), volume = h * h * h;
                 ++fluid;
@@ -22,11 +22,12 @@ namespace pyro::sparse {
             for (int a = 0; a < 3; ++a) {
                 if constexpr (full) div += (side_velocity<boundary_mode>(grid, grid.state, i, a, 1, true) - side_velocity<boundary_mode>(grid, grid.state, i, a, -1, true)) / spacing(grid.layout, i);
                 float v = fmaxf(fabsf(side_velocity<boundary_mode>(grid, grid.state, i, a, -1)), fabsf(side_velocity<boundary_mode>(grid, grid.state, i, a, 1)));
-                velocity_squared += v * v;
+                velocity_bound += full ? v * v : v;
             }
             if constexpr (full) divergence = fmax(divergence, double(fabsf(div)));
-            speed        = fmax(speed, double(sqrtf(velocity_squared)));
-            acceleration = fmax(acceleration, double(fabsf(config.buoyancy * grid.state.temperature[i] - config.smoke_weight * grid.state.smoke[i])));
+            speed        = fmax(speed, double(full ? sqrtf(velocity_bound) : velocity_bound));
+            float direction = full ? sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z) : fabsf(config.up.x) + fabsf(config.up.y) + fabsf(config.up.z);
+            acceleration = fmax(acceleration, double(fabsf(config.buoyancy * grid.state.temperature[i] - config.smoke_weight * grid.state.smoke[i]) * direction));
         }
         if constexpr (full) {
             double values[6]{fluid, divergence, speed, smoke, heat, acceleration};
@@ -53,9 +54,13 @@ namespace pyro::sparse {
         double value = 0;
         for (int b = 0; b < grid.layout.count; ++b) value = full && (k == 0 || k == 3 || k == 4) ? value + results[b * count + k] : fmax(value, results[b * count + k]);
         if (k == (full ? 2 : 0)) {
+            constexpr float motion_metric = full ? 1.f : 1.732050808f;
             for (int s = 0; s < source_count; ++s)
-                if (time >= sources[s].start_time && time <= sources[s].end_time) value = fmax(value, double(sqrtf(sources[s].velocity.x * sources[s].velocity.x + sources[s].velocity.y * sources[s].velocity.y + sources[s].velocity.z * sources[s].velocity.z) + sources[s].instance.max_speed * sources[s].inherit_velocity));
-            value = fmax(value, double(grid.collider_speed));
+                if (time >= sources[s].start_time && time <= sources[s].end_time) {
+                    float source_speed = full ? sqrtf(sources[s].velocity.x * sources[s].velocity.x + sources[s].velocity.y * sources[s].velocity.y + sources[s].velocity.z * sources[s].velocity.z) : fabsf(sources[s].velocity.x) + fabsf(sources[s].velocity.y) + fabsf(sources[s].velocity.z);
+                    value = fmax(value, double(source_speed + motion_metric * sources[s].instance.max_speed * sources[s].inherit_velocity));
+                }
+            value = fmax(value, double(motion_metric * grid.collider_speed));
         }
         results[grid.layout.count * count + k] = value;
     }

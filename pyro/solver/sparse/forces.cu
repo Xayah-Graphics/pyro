@@ -70,7 +70,7 @@ namespace pyro::sparse {
                 else weight = source_weight<inherited>(source, p, h, time + dt * .5f, &motion);
                 if (weight == 0) continue;
                 float target = axis == 0 ? source.velocity.x + motion.x * source.inherit_velocity : axis == 1 ? source.velocity.y + motion.y * source.inherit_velocity : source.velocity.z + motion.z * source.inherit_velocity;
-                v += (target - v) * (1 - expf(-source.velocity_rate * weight * active));
+                v += (target - v) * -expm1f(-source.velocity_rate * weight * active);
             }
         destination.velocity[f] = v;
     }

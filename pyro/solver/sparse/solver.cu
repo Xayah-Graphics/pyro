@@ -320,7 +320,7 @@ namespace pyro::sparse {
         int capacity   = static_cast<int>(std::bit_ceil(static_cast<unsigned>(std::max(required, previous * 2))));
         int table_size = static_cast<int>(std::bit_ceil(static_cast<unsigned>(capacity * 8)));
         auto cells = capacity * 512ull, faces = capacity * 1728ull;
-        auto distances = capacity * 729ull, samples = capacity * 5ull * 1331;
+        auto distances = capacity * 729ull, samples = capacity * 3ull * 1331;
         int edges            = capacity * (config.grid.levels > 1 ? 4032 : 1728);
         int scratch_capacity = std::max(edges, table_size);
         stream.sync();
@@ -331,7 +331,7 @@ namespace pyro::sparse {
         auto face_data      = ::cuda::make_buffer<Face>(stream, pool.as_ref(), faces * 2, ::cuda::no_init);
         auto links          = ::cuda::make_buffer<Links>(stream, pool.as_ref(), capacity * 384ull * 2, ::cuda::no_init);
         auto masks          = ::cuda::make_buffer<unsigned char>(stream, pool.as_ref(), cells * 2 + samples, ::cuda::no_init);
-        auto fields         = ::cuda::make_buffer<float>(stream, pool.as_ref(), 6 * (cells * 2 + faces) + cells * 2 + distances * 6 + samples * 3 + scratch_capacity * 2ull, ::cuda::no_init);
+        auto fields         = ::cuda::make_buffer<float>(stream, pool.as_ref(), 4 * (cells * 2 + faces) + faces * 2 + cells * 2 + distances * 6 + samples * 3 + scratch_capacity * 2ull, ::cuda::no_init);
         ::cuda::fill_bytes(stream, blocks, 0);
         ::cuda::fill_bytes(stream, keys, 0);
         ::cuda::fill_bytes(stream, indices, 0);
@@ -360,29 +360,27 @@ namespace pyro::sparse {
             }
             ++slot;
         }
-        for (auto* state : {&grid.state, &spare.state, &grid.midpoint, &grid.next, &grid.transported}) {
+        for (auto* state : {&grid.state, &spare.state, &grid.midpoint, &grid.next}) {
             state->smoke = field;
             field += cells;
             state->temperature = field;
             field += cells;
             state->velocity = field;
             field += faces;
-            state->samples = nullptr;
+            state->velocity_samples = nullptr;
         }
+        grid.transported.velocity = field;
+        field += faces;
         spare.midpoint    = grid.midpoint;
         spare.next        = grid.next;
         spare.transported = grid.transported;
         for (int i = 0; i < 3; ++i) {
-            grid.samples[i] = spare.samples[i] = field;
+            grid.velocity_samples[i] = spare.velocity_samples[i] = field;
             field += samples;
         }
-        grid.upper.smoke = spare.upper.smoke = field;
-        field += cells;
-        grid.upper.temperature = spare.upper.temperature = field;
-        field += cells;
-        grid.upper.velocity = spare.upper.velocity = field;
+        grid.velocity_scratch = spare.velocity_scratch = field;
         field += faces;
-        grid.uniform_samples = spare.uniform_samples = masks.data() + cells * 2;
+        grid.uniform_velocity_samples = spare.uniform_velocity_samples = masks.data() + cells * 2;
         topology.roots                               = keys.data() + table_size * 2ull;
         topology.refine                              = keys.data() + table_size * 3ull;
         auto* index                                  = indices.data() + table_size * 2ull;

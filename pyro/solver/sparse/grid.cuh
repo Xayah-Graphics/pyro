@@ -61,7 +61,7 @@ namespace pyro::sparse {
         float* smoke{};
         float* temperature{};
         float* velocity{};
-        float* samples{};
+        float* velocity_samples{};
     };
 
     struct Face {
@@ -88,9 +88,9 @@ namespace pyro::sparse {
         Fields midpoint;
         Fields next;
         Fields transported;
-        Fields upper;
-        float* samples[3]{};
-        unsigned char* uniform_samples{};
+        float* velocity_scratch{};
+        float* velocity_samples[3]{};
+        unsigned char* uniform_velocity_samples{};
         float* distance[3]{};
         float geometry_time{};
         float geometry_duration{};
@@ -309,15 +309,15 @@ namespace pyro::sparse {
         float3 q{p.x * inverse_h - stagger.x, p.y * inverse_h - stagger.y, p.z * inverse_h - stagger.z};
         int3 base{int(floorf(q.x)), int(floorf(q.y)), int(floorf(q.z))};
         float3 t{q.x - base.x, q.y - base.y, q.z - base.z};
-        int first = (block * 5 + field) * 1331 + base.x - node.coordinate.x * 8 + 1 + 11 * (base.y - node.coordinate.y * 8 + 1) + 121 * (base.z - node.coordinate.z * 8 + 1);
+        int first = (block * 3 + field) * 1331 + base.x - node.coordinate.x * 8 + 1 + 11 * (base.y - node.coordinate.y * 8 + 1) + 121 * (base.z - node.coordinate.z * 8 + 1);
         float sum = 0, lo = 1.e30f, hi = -1.e30f;
         bool same_level = true;
         for (int z = 0; z < 2; ++z)
             for (int y = 0; y < 2; ++y)
                 for (int x = 0; x < 2; ++x) {
                     int index   = first + x + 11 * y + 121 * z;
-                    float value = fields.samples[index];
-                    if constexpr (uniform_output) same_level &= grid.uniform_samples[index] != 0;
+                    float value = fields.velocity_samples[index];
+                    if constexpr (uniform_output) same_level &= grid.uniform_velocity_samples[index] != 0;
                     sum += value * (x ? t.x : 1 - t.x) * (y ? t.y : 1 - t.y) * (z ? t.z : 1 - t.z);
                     if constexpr (bounds) {
                         lo = fminf(lo, value);
@@ -348,11 +348,9 @@ namespace pyro::sparse {
                 for (int x = 0; x < 2; ++x) {
                     float3 point{(base.x + x) * h, (base.y + y) * h, (base.z + z) * h};
                     int i = locate(grid.layout, point);
-                    if (field < 3) {
-                        float epsilon = grid.layout.h * .001f;
-                        int left      = locate(grid.layout, float3{point.x - (field == 0 ? epsilon : 0), point.y - (field == 1 ? epsilon : 0), point.z - (field == 2 ? epsilon : 0)});
-                        if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
-                    }
+                    float epsilon = grid.layout.h * .001f;
+                    int left = locate(grid.layout, float3{point.x - (field == 0 ? epsilon : 0), point.y - (field == 1 ? epsilon : 0), point.z - (field == 2 ? epsilon : 0)});
+                    if (left >= 0 && (i < 0 || spacing(grid.layout, left) < spacing(grid.layout, i))) i = left;
                     if (i < 0)
                         for (int corner = 1; corner < 8 && i < 0; ++corner) i = locate(grid.layout, float3{point.x - (corner & 1 ? .002f : 0) * h, point.y - (corner & 2 ? .002f : 0) * h, point.z - (corner & 4 ? .002f : 0) * h});
                     float value = i < 0 ? background : native_sample(grid, fields, point, field, i);

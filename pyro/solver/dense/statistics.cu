@@ -12,7 +12,12 @@ namespace pyro::dense {
         float volume = cell_size * cell_size * cell_size;
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i                = id * tile_cells + local;
-            float speed          = sqrtf(fields.velocity[0][i] * fields.velocity[0][i] + fields.velocity[1][i] * fields.velocity[1][i] + fields.velocity[2][i] * fields.velocity[2][i]);
+            float speed = 0;
+            if constexpr (full) speed = sqrtf(fields.velocity[0][i] * fields.velocity[0][i] + fields.velocity[1][i] * fields.velocity[1][i] + fields.velocity[2][i] * fields.velocity[2][i]);
+            else {
+                if (!grid.fluid[i]) continue;
+                for (int axis = 0; axis < 3; ++axis) speed += fmaxf(fabsf(fields.velocity[axis][i]), fabsf(value(fields.velocity[axis], neighbor(grid.layout, i, axis, 1))));
+            }
             values[full ? 2 : 0] = fmax(values[full ? 2 : 0], static_cast<double>(isfinite(speed) ? speed : INFINITY));
             if (!grid.fluid[i]) continue;
             if constexpr (full) {
@@ -29,7 +34,8 @@ namespace pyro::dense {
                 values[3] += fields.smoke[i] * volume;
                 values[4] += fields.temperature[i] * volume;
             }
-            values[full ? 5 : 1] = fmax(values[full ? 5 : 1], static_cast<double>(fabsf(config.buoyancy * fields.temperature[i] - config.smoke_weight * fields.smoke[i]) * sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z)));
+            float direction = full ? sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z) : fabsf(config.up.x) + fabsf(config.up.y) + fabsf(config.up.z);
+            values[full ? 5 : 1] = fmax(values[full ? 5 : 1], static_cast<double>(fabsf(config.buoyancy * fields.temperature[i] - config.smoke_weight * fields.smoke[i]) * direction));
         }
 #pragma unroll
         for (int k = 0; k < channels; ++k) sums[k][threadIdx.x] = values[k];
@@ -76,14 +82,17 @@ namespace pyro::dense {
         for (int k = 0; k < channels; ++k) values[k] = sums[k][0];
 #pragma unroll
         for (int k = 0; k < channels; ++k) partial[count * static_cast<unsigned long long>(channels) + k] = values[k];
-        float speed = fmaxf(static_cast<float>(values[full ? 2 : 0]), sqrtf(wind.x * wind.x + wind.y * wind.y + wind.z * wind.z)), acceleration = static_cast<float>(values[full ? 5 : 1]);
+        float speed = fmaxf(static_cast<float>(values[full ? 2 : 0]), full ? sqrtf(wind.x * wind.x + wind.y * wind.y + wind.z * wind.z) : fabsf(wind.x) + fabsf(wind.y) + fabsf(wind.z)), acceleration = static_cast<float>(values[full ? 5 : 1]);
+        constexpr float motion_metric = full ? 1.f : 1.732050808f;
         for (int i = 0; i < source_count; ++i) {
             SourceView source = sources[i];
             if (time >= source.end_time || time + max_time_step < source.start_time) continue;
-            speed = fmaxf(speed, sqrtf(source.velocity.x * source.velocity.x + source.velocity.y * source.velocity.y + source.velocity.z * source.velocity.z) + source.instance.max_speed * fmaxf(1.0f, source.inherit_velocity));
-            acceleration += (fabsf(config.buoyancy * source.temperature_rate) + fabsf(config.smoke_weight * source.smoke_rate)) * max_time_step * sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z);
+            float source_speed = full ? sqrtf(source.velocity.x * source.velocity.x + source.velocity.y * source.velocity.y + source.velocity.z * source.velocity.z) : fabsf(source.velocity.x) + fabsf(source.velocity.y) + fabsf(source.velocity.z);
+            speed = fmaxf(speed, source_speed + motion_metric * source.instance.max_speed * fmaxf(1.0f, source.inherit_velocity));
+            float direction = full ? sqrtf(config.up.x * config.up.x + config.up.y * config.up.y + config.up.z * config.up.z) : fabsf(config.up.x) + fabsf(config.up.y) + fabsf(config.up.z);
+            acceleration += (fabsf(config.buoyancy * source.temperature_rate) + fabsf(config.smoke_weight * source.smoke_rate)) * max_time_step * direction;
         }
-        speed      = fmaxf(speed, collider_speed);
+        speed      = fmaxf(speed, motion_metric * collider_speed);
         maximum[0] = speed;
         maximum[1] = acceleration;
     }

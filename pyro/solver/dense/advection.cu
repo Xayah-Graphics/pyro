@@ -3,10 +3,17 @@
 #include <cuda/launch>
 
 namespace pyro::dense {
+    struct ScalarReconstruction {
+        float3 gradient;
+        float predictor;
+        float lower;
+        float upper;
+    };
+
     template <BoundaryMode boundary_mode>
     __device__ float3 trace(Grid grid, Fields carrier, float3 p, float3 wind, float h, float end_time, float dt, bool& clipped) {
         Layout layout = grid.layout;
-        clipped       = false;
+        clipped = false;
         float first_distance = 0;
         if constexpr (boundary_mode != BoundaryMode::none) {
             float3 world{grid.origin.x + p.x * h, grid.origin.y + p.y * h, grid.origin.z + p.z * h};
@@ -16,11 +23,11 @@ namespace pyro::dense {
                 float e = 0.25f * h;
                 float3 gradient{sample_boundary<boundary_mode>(grid, {world.x + e, world.y, world.z}, end_time, h) - sample_boundary<boundary_mode>(grid, {world.x - e, world.y, world.z}, end_time, h), sample_boundary<boundary_mode>(grid, {world.x, world.y + e, world.z}, end_time, h) - sample_boundary<boundary_mode>(grid, {world.x, world.y - e, world.z}, end_time, h), sample_boundary<boundary_mode>(grid, {world.x, world.y, world.z + e}, end_time, h) - sample_boundary<boundary_mode>(grid, {world.x, world.y, world.z - e}, end_time, h)};
                 float scale = (0.01f * h - distance) / (h * fmaxf(sqrtf(gradient.x * gradient.x + gradient.y * gradient.y + gradient.z * gradient.z), 1.0e-20f));
-                p           = {p.x + gradient.x * scale, p.y + gradient.y * scale, p.z + gradient.z * scale};
-                clipped     = true;
+                p = {p.x + gradient.x * scale, p.y + gradient.y * scale, p.z + gradient.z * scale};
+                clipped = true;
             }
         }
-        float3 first  = sample_velocity(layout, carrier, p, wind);
+        float3 first = sample_velocity(layout, carrier, p, wind);
         float3 middle = sample_velocity(layout, carrier, {p.x - first.x * (0.5f * dt / h), p.y - first.y * (0.5f * dt / h), p.z - first.z * (0.5f * dt / h)}, wind);
         float3 departure{p.x - middle.x * (dt / h), p.y - middle.y * (dt / h), p.z - middle.z * (dt / h)};
         if constexpr (boundary_mode == BoundaryMode::none) return departure;
@@ -48,38 +55,15 @@ namespace pyro::dense {
         return {p.x + delta.x * fraction, p.y + delta.y * fraction, p.z + delta.z * fraction};
     }
 
-    template <bool bounds = false>
-    __device__ float2 sample_scalars(Layout layout, Fields fields, float3 position, float2* lower = nullptr, float2* upper = nullptr) {
-        int3 p{static_cast<int>(floorf(position.x)), static_cast<int>(floorf(position.y)), static_cast<int>(floorf(position.z))};
-        float3 t{position.x - p.x, position.y - p.y, position.z - p.z};
-        float2 result{}, lo{1.0e30f, 1.0e30f}, hi{-1.0e30f, -1.0e30f};
-        for (int z = 0; z < 2; ++z)
-            for (int y = 0; y < 2; ++y)
-                for (int x = 0; x < 2; ++x) {
-                    int i       = cell_index(layout, {p.x + x, p.y + y, p.z + z});
-                    float smoke = value(fields.smoke, i), heat = value(fields.temperature, i);
-                    result.x += smoke * (x ? t.x : 1.0f - t.x) * (y ? t.y : 1.0f - t.y) * (z ? t.z : 1.0f - t.z);
-                    result.y += heat * (x ? t.x : 1.0f - t.x) * (y ? t.y : 1.0f - t.y) * (z ? t.z : 1.0f - t.z);
-                    if constexpr (bounds) {
-                        lo.x = fminf(lo.x, smoke);
-                        lo.y = fminf(lo.y, heat);
-                        hi.x = fmaxf(hi.x, smoke);
-                        hi.y = fmaxf(hi.y, heat);
-                    }
-                }
-        if constexpr (bounds) *lower = lo;
-        if constexpr (bounds) *upper = hi;
-        return result;
-    }
-
     template <bool correct, BoundaryMode boundary_mode>
     __global__ void transport_velocity(Grid grid, float cell_size, float3 wind, Fields destination, Fields original, Fields carrier, float time, float dt) {
         int id = static_cast<int>(blockIdx.x), axis = blockIdx.y;
         for (int local = threadIdx.x; local < (boundary_mode == BoundaryMode::none ? tile_cells : threads); local += blockDim.x) {
-            int i         = id * (boundary_mode == BoundaryMode::none ? tile_cells : threads) + local;
+            int i = id * (boundary_mode == BoundaryMode::none ? tile_cells : threads) + local;
             float* output = correct ? destination.velocity[axis] : grid.transported.velocity[axis];
             if (!face_valid(grid.layout, cell_coordinate(grid.layout, i), axis)) {
-                output[i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
+                output[i] = (axis == 0 ? wind.x : axis == 1 ? wind.y
+                                                            : wind.z);
                 continue;
             }
             if constexpr (boundary_mode != BoundaryMode::none)
@@ -94,15 +78,20 @@ namespace pyro::dense {
             if (axis == 2) stagger.z = 0.0f;
             float3 p{c.x + stagger.x, c.y + stagger.y, c.z + stagger.z};
             const float* input = original.velocity[axis];
-            float background   = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
+            float background = (axis == 0 ? wind.x : axis == 1 ? wind.y
+                                                               : wind.z);
             float transported;
             if constexpr (correct) {
-                float lo = destination.velocity[axis][i], hi = grid.upper.velocity[axis][i];
+                float lo = destination.velocity[axis][i], hi = grid.velocity_scratch[axis][i];
                 transported = grid.transported.velocity[axis][i];
-                if (boundary_mode == BoundaryMode::none || lo <= hi) {
+                if (lo == hi) transported = lo;
+                else if (boundary_mode == BoundaryMode::none || lo <= hi) {
                     bool clipped;
                     float3 reverse = trace<boundary_mode>(grid, carrier, p, wind, cell_size, time, -dt, clipped);
-                    if (!clipped) transported = fminf(hi, fmaxf(lo, transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], {reverse.x - stagger.x, reverse.y - stagger.y, reverse.z - stagger.z}, background))));
+                    if (!clipped) {
+                        float corrected = transported + 0.5f * (input[i] - sample(grid.layout, grid.transported.velocity[axis], {reverse.x - stagger.x, reverse.y - stagger.y, reverse.z - stagger.z}, background));
+                        if (corrected >= lo && corrected <= hi) transported = corrected;
+                    }
                 }
             } else {
                 bool clipped;
@@ -110,67 +99,114 @@ namespace pyro::dense {
                 float lo, hi;
                 transported = sample<true>(grid.layout, input, {departure.x - stagger.x, departure.y - stagger.y, departure.z - stagger.z}, background, &lo, &hi);
                 destination.velocity[axis][i] = clipped ? 1 : lo;
-                grid.upper.velocity[axis][i] = clipped ? -1 : hi;
+                grid.velocity_scratch[axis][i] = clipped ? -1 : hi;
             }
             output[i] = transported;
         }
     }
 
-    template <bool correct, BoundaryMode boundary_mode>
-    __global__ void transport_scalars(Grid grid, float cell_size, float3 wind, Fields destination, Fields original, Fields carrier, float time, float dt) {
-        int id = static_cast<int>(blockIdx.x);
-        for (int local = threadIdx.x; local < (boundary_mode == BoundaryMode::none ? tile_cells : threads); local += blockDim.x) {
-            int i = id * (boundary_mode == BoundaryMode::none ? tile_cells : threads) + local;
-            auto output = correct ? destination : grid.transported;
-            if (!grid.fluid[i]) {
-                output.smoke[i]       = 0.0f;
-                output.temperature[i] = 0.0f;
-                continue;
-            }
-            int3 c = cell_coordinate(grid.layout, i);
-            float3 stagger{0.5f, 0.5f, 0.5f}, p{c.x + 0.5f, c.y + 0.5f, c.z + 0.5f};
-            float2 transported;
-            if constexpr (correct) {
-                float2 lo{destination.smoke[i], destination.temperature[i]}, hi{grid.upper.smoke[i], grid.upper.temperature[i]};
-                transported = {grid.transported.smoke[i], grid.transported.temperature[i]};
-                bool constant = __float_as_uint(lo.x) == __float_as_uint(hi.x) && __float_as_uint(lo.y) == __float_as_uint(hi.y) && __float_as_uint(transported.x) == __float_as_uint(lo.x) && __float_as_uint(transported.y) == __float_as_uint(lo.y);
-                if (!constant && (boundary_mode == BoundaryMode::none || lo.x <= hi.x)) {
-                    bool clipped;
-                    float3 reverse = trace<boundary_mode>(grid, carrier, p, wind, cell_size, time, -dt, clipped);
-                    if (!clipped) {
-                        float2 backward = sample_scalars(grid.layout, grid.transported, {reverse.x - stagger.x, reverse.y - stagger.y, reverse.z - stagger.z});
-                        transported.x = fminf(hi.x, fmaxf(lo.x, transported.x + 0.5f * (original.smoke[i] - backward.x)));
-                        transported.y = fminf(hi.y, fmaxf(lo.y, transported.y + 0.5f * (original.temperature[i] - backward.y)));
-                    }
+    template <BoundaryMode boundary_mode>
+    __global__ void reconstruct_scalars(Grid grid, Fields original, Fields carrier, float cell_size, float dt, ScalarReconstruction* smoke, ScalarReconstruction* temperature) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.cells || !grid.fluid[i]) return;
+        float h = cell_size;
+        ScalarReconstruction result[2];
+        bool varying = false;
+        for (int field = 0; field < 2; ++field) {
+            const float* values = field ? original.temperature : original.smoke;
+            float q = values[i], lower = q, upper = q, slopes[3];
+            for (int a = 0; a < 3; ++a) {
+                int left = neighbor(grid.layout, i, a, -1), right = neighbor(grid.layout, i, a, 1);
+                bool left_open = left >= 0 && grid.fluid[left], right_open = right >= 0 && grid.fluid[right];
+                if constexpr (boundary_mode != BoundaryMode::none) {
+                    left_open &= grid.aperture[a][i] > 0;
+                    right_open &= grid.aperture[a][right] > 0;
                 }
-            } else {
-                bool clipped;
-                float3 departure = trace<boundary_mode>(grid, carrier, p, wind, cell_size, time + dt, dt, clipped);
-                float2 lo, hi;
-                transported = sample_scalars<true>(grid.layout, original, {departure.x - stagger.x, departure.y - stagger.y, departure.z - stagger.z}, &lo, &hi);
-                destination.smoke[i] = clipped ? 1 : lo.x;
-                destination.temperature[i] = lo.y;
-                grid.upper.smoke[i] = clipped ? -1 : hi.x;
-                grid.upper.temperature[i] = hi.y;
+                float l = left_open ? values[left] : q;
+                float r = right_open ? values[right] : q;
+                lower = fminf(lower, fminf(l, r));
+                upper = fmaxf(upper, fmaxf(l, r));
+                float dl = (q - l) / h, dr = (r - q) / h;
+                float central = .5f * (dl + dr);
+                slopes[a] = dl * dr > 0 ? copysignf(fminf(fabsf(central), 2 * fminf(fabsf(dl), fabsf(dr))), dl) : 0;
             }
-            output.smoke[i]       = transported.x;
-            output.temperature[i] = transported.y;
+            result[field] = {{slopes[0], slopes[1], slopes[2]}, q, lower, upper};
+            varying |= slopes[0] != 0 || slopes[1] != 0 || slopes[2] != 0;
         }
+        if (varying) {
+            float3 velocity{.5f * (carrier.velocity[0][i] + carrier.velocity[0][neighbor(grid.layout, i, 0, 1)]), .5f * (carrier.velocity[1][i] + carrier.velocity[1][neighbor(grid.layout, i, 1, 1)]), .5f * (carrier.velocity[2][i] + carrier.velocity[2][neighbor(grid.layout, i, 2, 1)])};
+            for (auto& value : result) value.predictor -= .5f * dt * (velocity.x * value.gradient.x + velocity.y * value.gradient.y + velocity.z * value.gradient.z);
+        }
+        smoke[i] = result[0];
+        temperature[i] = result[1];
+    }
+
+    template <BoundaryMode boundary_mode>
+    __global__ void scalar_fluxes(Grid grid, Fields carrier, float cell_size, const ScalarReconstruction* smoke, const ScalarReconstruction* temperature) {
+        int f = blockIdx.x * blockDim.x + threadIdx.x, axis = blockIdx.y;
+        if (f >= grid.layout.cells) return;
+        auto c = cell_coordinate(grid.layout, f);
+        if (!face_valid(grid.layout, c, axis)) return;
+        float h = cell_size;
+        float area = (boundary_mode == BoundaryMode::none ? 1.f : grid.aperture[axis][f]) * h * h;
+        float speed = carrier.velocity[axis][f];
+        int upwind = speed >= 0 ? neighbor(grid.layout, f, axis, -1) : f;
+        float flux[2]{};
+        if (area > 0 && speed != 0 && upwind >= 0 && grid.fluid[upwind]) {
+            float offset = speed >= 0 ? .5f * h : -.5f * h;
+            for (int field = 0; field < 2; ++field) {
+                auto value = (field ? temperature : smoke)[upwind];
+                float slope = axis == 0 ? value.gradient.x : axis == 1 ? value.gradient.y : value.gradient.z;
+                float reconstructed = value.predictor + slope * offset;
+                flux[field] = speed * area * fminf(value.upper, fmaxf(value.lower, reconstructed));
+            }
+        }
+        grid.velocity_scratch[axis][f] = flux[0];
+        grid.transported.velocity[axis][f] = flux[1];
+    }
+
+    __global__ void conservative_cells(Grid grid, Fields original, Fields destination, float cell_size, float dt) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= grid.layout.cells) return;
+        if (!grid.fluid[i]) {
+            destination.smoke[i] = destination.temperature[i] = 0;
+            return;
+        }
+        float flux[2]{};
+        float h = cell_size;
+
+        for (int a = 0; a < 3; ++a) {
+            int high = neighbor(grid.layout, i, a, 1);
+            flux[0] += grid.velocity_scratch[a][high] - grid.velocity_scratch[a][i];
+            flux[1] += grid.transported.velocity[a][high] - grid.transported.velocity[a][i];
+        }
+
+        destination.smoke[i] = original.smoke[i] - dt / (h * h * h) * flux[0];
+        destination.temperature[i] = original.temperature[i] - dt / (h * h * h) * flux[1];
     }
 
     void advect(Grid grid, float cell_size, float3 wind, Fields destination, Fields original, Fields carrier, float start_time, float dt, ::cuda::stream_ref stream) {
+        auto* smoke = reinterpret_cast<ScalarReconstruction*>(grid.scalar_scratch[0]);
+        auto* temperature = reinterpret_cast<ScalarReconstruction*>(grid.scalar_scratch[1]);
         auto launch = [&]<BoundaryMode boundary_mode>() {
             constexpr int count = boundary_mode == BoundaryMode::none ? tile_cells : threads;
             dim3 velocity_blocks(grid.layout.cells / count, 3);
             ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(velocity_blocks), ::cuda::block_dims<threads>()), transport_velocity<false, boundary_mode>, grid, cell_size, wind, destination, original, carrier, start_time, dt);
-            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(grid.layout.cells / count), ::cuda::block_dims<threads>()), transport_scalars<false, boundary_mode>, grid, cell_size, wind, destination, original, carrier, start_time, dt);
             ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(velocity_blocks), ::cuda::block_dims<threads>()), transport_velocity<true, boundary_mode>, grid, cell_size, wind, destination, original, carrier, start_time, dt);
-            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(grid.layout.cells / count), ::cuda::block_dims<threads>()), transport_scalars<true, boundary_mode>, grid, cell_size, wind, destination, original, carrier, start_time, dt);
+            ::cuda::launch(stream, ::cuda::distribute<256>(grid.layout.cells), reconstruct_scalars<boundary_mode>, grid, original, carrier, cell_size, dt, smoke, temperature);
+            ::cuda::launch(stream, ::cuda::make_config(::cuda::grid_dims(dim3((grid.layout.cells + 255) / 256, 3)), ::cuda::block_dims<256>()), scalar_fluxes<boundary_mode>, grid, carrier, cell_size, smoke, temperature);
+            ::cuda::launch(stream, ::cuda::distribute<256>(grid.layout.cells), conservative_cells, grid, original, destination, cell_size, dt);
         };
         switch (grid.boundary_mode) {
-        case BoundaryMode::none: launch.template operator()<BoundaryMode::none>(); break;
-        case BoundaryMode::stationary: launch.template operator()<BoundaryMode::stationary>(); break;
-        case BoundaryMode::moving: launch.template operator()<BoundaryMode::moving>(); break;
+        case BoundaryMode::none:
+            launch.template operator()<BoundaryMode::none>();
+            break;
+        case BoundaryMode::stationary:
+            launch.template operator()<BoundaryMode::stationary>();
+            break;
+        case BoundaryMode::moving:
+            launch.template operator()<BoundaryMode::moving>();
+            break;
         }
     }
 

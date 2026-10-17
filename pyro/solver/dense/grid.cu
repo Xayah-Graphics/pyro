@@ -9,12 +9,13 @@ namespace pyro::dense {
     __global__ void initialize_kernel(Grid grid, float3 wind) {
         for (int local = threadIdx.x; local < tile_cells; local += blockDim.x) {
             int i = blockIdx.x * tile_cells + local;
-            Fields fields[]{grid.state, grid.midpoint, grid.next, grid.transported};
+            Fields fields[]{grid.state, grid.midpoint, grid.next};
             for (auto field : fields) {
                 field.smoke[i]       = 0;
                 field.temperature[i] = 0;
                 for (int axis = 0; axis < 3; ++axis) field.velocity[axis][i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
             }
+            for (int axis = 0; axis < 3; ++axis) grid.transported.velocity[axis][i] = (axis == 0 ? wind.x : axis == 1 ? wind.y : wind.z);
         }
     }
 

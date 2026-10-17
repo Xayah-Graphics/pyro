@@ -40,7 +40,8 @@ namespace pyro::dense {
         Fields midpoint;
         Fields next;
         Fields transported;
-        Fields upper;
+        float* velocity_scratch[3]{};
+        float* scalar_scratch[2]{};
     };
 
     __host__ __device__ inline bool interior(Layout layout, int3 p) {
